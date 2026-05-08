@@ -42,15 +42,6 @@ pub struct ds4_engine {
 }
 
 #[repr(C)]
-pub struct ds4_session {
-    _private: [u8; 0],
-}
-
-pub type ds4_session_progress_fn = Option<extern "C" fn(*mut c_void, *const c_char, c_int, c_int)>;
-pub type ds4_token_emit_fn = Option<extern "C" fn(*mut c_void, c_int)>;
-pub type ds4_generation_done_fn = Option<extern "C" fn(*mut c_void)>;
-
-#[repr(C)]
 #[derive(Debug)]
 pub struct ds4_engine_options {
     pub model_path: *const c_char,
@@ -179,34 +170,6 @@ extern "C" {
     pub fn ds4_engine_dump_tokens(e: *mut ds4_engine, tokens: *const ds4_tokens);
     pub fn ds4_token_eos(e: *mut ds4_engine) -> c_int;
 
-    pub fn ds4_session_create(out: *mut *mut ds4_session, e: *mut ds4_engine, ctx_size: c_int) -> c_int;
-    pub fn ds4_session_free(s: *mut ds4_session);
-    pub fn ds4_session_set_progress(s: *mut ds4_session, fn_ptr: ds4_session_progress_fn, ud: *mut c_void);
-    pub fn ds4_session_sync(s: *mut ds4_session, prompt: *const ds4_tokens, err: *mut c_char, errlen: usize) -> c_int;
-    pub fn ds4_session_common_prefix(s: *mut ds4_session, prompt: *const ds4_tokens) -> c_int;
-    pub fn ds4_session_sample(
-        s: *mut ds4_session,
-        temperature: c_float,
-        top_k: c_int,
-        top_p: c_float,
-        min_p: c_float,
-        rng: *mut u64,
-    ) -> c_int;
-    pub fn ds4_session_eval(s: *mut ds4_session, token: c_int, err: *mut c_char, errlen: usize) -> c_int;
-    pub fn ds4_session_eval_speculative_argmax(
-        s: *mut ds4_session,
-        first_token: c_int,
-        max_tokens: c_int,
-        eos_token: c_int,
-        accepted: *mut c_int,
-        accepted_cap: c_int,
-        err: *mut c_char,
-        errlen: usize,
-    ) -> c_int;
-    pub fn ds4_session_invalidate(s: *mut ds4_session);
-    pub fn ds4_session_rewind(s: *mut ds4_session, pos: c_int);
-    pub fn ds4_session_pos(s: *mut ds4_session) -> c_int;
-    pub fn ds4_session_ctx(s: *mut ds4_session) -> c_int;
     pub fn ds4_engine_mtp_draft_tokens(e: *mut ds4_engine) -> c_int;
     pub fn ds4_tokens_push(tv: *mut ds4_tokens, token: c_int);
     pub fn ds4_tokens_free(tv: *mut ds4_tokens);

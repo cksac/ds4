@@ -5,13 +5,12 @@ use gguf::{
     validate_model_config_bytes, BoundTensor, Ds4LayerTensorBindings, Ds4MtpTensorBindings,
     Ds4TensorBindings, GgufMap, ModelSummary, TensorDirectory, TokenizerMetadata,
 };
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::ptr::{self, NonNull};
 use std::slice;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use libc::c_char;
 
 pub const RENDERED_CHAT_BOS: &str = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>";
 
@@ -3911,104 +3910,6 @@ impl<'a> RustSession<'a> {
     }
 }
 
-#[derive(Debug)]
-pub struct Session {
-    ptr: NonNull<ffi::ds4_session>,
-}
-
-unsafe impl Send for Session {}
-
-impl Session {
-    pub fn create(engine: &Engine, ctx_size: i32) -> Result<Self> {
-        let mut out = ptr::null_mut();
-        let rc = unsafe { ffi::ds4_session_create(&mut out, engine.ptr.as_ptr(), ctx_size) };
-        if rc != 0 || out.is_null() {
-            bail!("failed to create session")
-        }
-        Ok(Self {
-            ptr: NonNull::new(out).expect("ds4_session_create returned null without error"),
-        })
-    }
-
-    pub fn sync(&mut self, prompt: &Tokens) -> Result<()> {
-        let mut err = [0 as c_char; 256];
-        let rc = unsafe { ffi::ds4_session_sync(self.ptr.as_ptr(), prompt.as_ptr(), err.as_mut_ptr(), err.len()) };
-        if rc != 0 {
-            bail!(error_buffer(&err))
-        }
-        Ok(())
-    }
-
-    pub fn common_prefix(&mut self, prompt: &Tokens) -> i32 {
-        unsafe { ffi::ds4_session_common_prefix(self.ptr.as_ptr(), prompt.as_ptr()) }
-    }
-
-    pub fn sample(&mut self, temperature: f32, top_k: i32, top_p: f32, min_p: f32, rng: &mut u64) -> i32 {
-        unsafe { ffi::ds4_session_sample(self.ptr.as_ptr(), temperature, top_k, top_p, min_p, rng) }
-    }
-
-    pub fn eval(&mut self, token: i32) -> Result<()> {
-        let mut err = [0 as c_char; 256];
-        let rc = unsafe { ffi::ds4_session_eval(self.ptr.as_ptr(), token, err.as_mut_ptr(), err.len()) };
-        if rc != 0 {
-            bail!(error_buffer(&err))
-        }
-        Ok(())
-    }
-
-    pub fn eval_speculative_argmax(
-        &mut self,
-        first_token: i32,
-        max_tokens: i32,
-        eos_token: i32,
-        accepted: &mut [i32],
-    ) -> Result<usize> {
-        let mut err = [0 as c_char; 256];
-        let rc = unsafe {
-            ffi::ds4_session_eval_speculative_argmax(
-                self.ptr.as_ptr(),
-                first_token,
-                max_tokens,
-                eos_token,
-                accepted.as_mut_ptr(),
-                accepted.len() as i32,
-                err.as_mut_ptr(),
-                err.len(),
-            )
-        };
-        if rc < 0 {
-            bail!(error_buffer(&err))
-        }
-        Ok(rc as usize)
-    }
-
-    pub fn invalidate(&mut self) {
-        unsafe { ffi::ds4_session_invalidate(self.ptr.as_ptr()) }
-    }
-
-    pub fn rewind(&mut self, pos: i32) {
-        unsafe { ffi::ds4_session_rewind(self.ptr.as_ptr(), pos) }
-    }
-
-    pub fn pos(&self) -> i32 {
-        unsafe { ffi::ds4_session_pos(self.ptr.as_ptr()) }
-    }
-
-    pub fn ctx(&self) -> i32 {
-        unsafe { ffi::ds4_session_ctx(self.ptr.as_ptr()) }
-    }
-
-    pub fn clear_progress(&mut self) {
-        unsafe { ffi::ds4_session_set_progress(self.ptr.as_ptr(), None, ptr::null_mut()) }
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        unsafe { ffi::ds4_session_free(self.ptr.as_ptr()) }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct ChatMessage {
     pub role: String,
@@ -4091,45 +3992,6 @@ pub trait GenerationSessionLike {
         accepted_buf: &mut [i32; 17],
     ) -> Result<usize>;
     fn clear_progress(&mut self) {}
-}
-
-impl GenerationSessionLike for Session {
-    fn sync_prompt(&mut self, prompt: &Tokens) -> Result<()> {
-        Session::sync(self, prompt)
-    }
-
-    fn ctx(&self) -> i32 {
-        Session::ctx(self)
-    }
-
-    fn pos(&self) -> i32 {
-        Session::pos(self)
-    }
-
-    fn sample_token(&mut self, temperature: f32, top_k: i32, top_p: f32, min_p: f32, rng: &mut u64) -> i32 {
-        Session::sample(self, temperature, top_k, top_p, min_p, rng)
-    }
-
-    fn eval_generated(
-        &mut self,
-        token: i32,
-        use_mtp: bool,
-        remaining: i32,
-        eos: i32,
-        accepted_buf: &mut [i32; 17],
-    ) -> Result<usize> {
-        if use_mtp {
-            Session::eval_speculative_argmax(self, token, remaining, eos, accepted_buf)
-        } else {
-            Session::eval(self, token)?;
-            accepted_buf[0] = token;
-            Ok(1)
-        }
-    }
-
-    fn clear_progress(&mut self) {
-        Session::clear_progress(self)
-    }
 }
 
 impl<'a> GenerationSessionLike for RustSession<'a> {
@@ -4447,15 +4309,6 @@ pub fn generate_with_session<S: GenerationSessionLike>(
     })
 }
 
-pub fn generate(
-    engine: &Engine,
-    session: &mut Session,
-    prompt: &Tokens,
-    options: GenerationOptions,
-) -> Result<GenerationResult> {
-    generate_with_session(engine, session, prompt, options)
-}
-
 pub fn generate_rust(
     engine: &Engine,
     session: &mut RustSession<'_>,
@@ -4463,12 +4316,6 @@ pub fn generate_rust(
     options: GenerationOptions,
 ) -> Result<GenerationResult> {
     generate_with_session(engine, session, prompt, options)
-}
-
-fn error_buffer(buf: &[c_char]) -> String {
-    unsafe { CStr::from_ptr(buf.as_ptr()) }
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn default_seed() -> u64 {

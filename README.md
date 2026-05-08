@@ -1,25 +1,26 @@
-# ds4.c
+# ds4
 
-`ds4.c` is a small native inference engine for DeepSeek V4 Flash. It is
+`ds4` is a native inference engine for DeepSeek V4 Flash. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
-runtime, and not a framework. The main path is a DeepSeek V4 Flash-specific
-Metal graph executor with DS4-specific loading, prompt rendering, KV state, and
-server API glue.
+runtime, and not a framework. The inference path is a DeepSeek V4 Flash-specific
+Metal GPU graph executor with DS4-specific loading, prompt rendering, KV state,
+and server API glue. The app layer is written in Rust; the engine core and Metal
+dispatch are in C.
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
 other contributors.
 
-Now, back at this project. Why we believe DeepSeek v4 Flash to be a pretty special
-model deserving a stand alone engine? Because after comparing it with powerful smaller
-dense models, we can report that:
+Why we believe DeepSeek v4 Flash to be a pretty special model deserving a stand
+alone engine? Because after comparing it with powerful smaller dense models, we
+can report that:
 
 1. DeepSeek v4 Flash is faster because of less active parameters.
 2. In thinking mode, if you avoid *max thinking*, it produces a thinking section that is a lot shorter than other models, even 1/5 of other models in many cases, and crucially, the thinking section length is **proportional to the problem complexity**. This makes DeepSeek v4 Flash usable with thinking enabled when other models are practically impossible to use in the same conditions.
 3. The model features a context window of **1 million tokens**.
 4. Being so large, it knows more things if you go sampling at the edge of knowledge. For instance asking about Italian show or political questions soon uncovers that 284B parameters are a lot more than 27B or 35B parameters.
 5. It writes much better English and Italian. It *feels* a quasi-frontier model.
-6. The KV cache is incredibly compress, allowing long context inference on local computers and **on disk KV cache persistence**.
+6. The KV cache is incredibly compressed, allowing long context inference on local computers and **on disk KV cache persistence**.
 7. It works well with 2-bit quantization, if quantized in a special way (read later). This allows to run it in MacBooks with 128GB of RAM.
 8. We expect DeepSeek to release **updated versions of v4 Flash** in the future, even better than the current one.
 
@@ -27,15 +28,15 @@ That said, a few important things about this project:
 
 * The local inference landscape contains many excellent projects, but new models are released continuously, and the attention immediately gets captured by the next model to implement. This project takes a deliberately narrow bet: one model at a time, official-vector validation (logits obtained with the official implementation), long-context tests, and enough agent integration to know if it really works. The exact model may change as the landscape evolves, but the constraint remains: local inference credible on high end personal machines or Mac Studios, starting from 128GB of memory.
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
-* This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache It is actually a first class disk citizen**.
+* This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
-* This is **Metal-only**, may implement CUDA support in the future? Perhaps, but nothing more. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. I was not possible to fix the CPU inference to avoid crashing, since each time there is to restart the computer, which is not funny. Help us, if you have the guts.
+* This is **Metal-only**, may implement CUDA support in the future? Perhaps, but nothing more. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks.
 
 ## Acknowledgements to llama.cpp and GGML
 
-`ds4.c` does not link against GGML, but it **exists thanks to the path opened by the
-llama.cpp project and the kernels, quantization formats, GGUF ecosystem, and hard-won
-engineering knowledge developed there**.
+`ds4` does not link against GGML, but it **exists thanks to the path opened by
+the llama.cpp project and the kernels, quantization formats, GGUF ecosystem, and
+hard-won engineering knowledge developed there**.
 We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
 and its contributors. Their implementation, kernels, tests, and design choices were
 an essential reference while building this DeepSeek V4 Flash-specific inference path.
@@ -56,90 +57,48 @@ experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
 majority of all the model space: the other components (shared experts,
 projections, routing) are left untouched to guarantee quality.
 
-`./download_model.sh` is now a compatibility shim over the Rust downloader
-binary `download-model-rs`.
-
-Download one main model:
+Download a model:
 
 ```sh
-./download_model.sh q2   # 128 GB RAM machines
-./download_model.sh q4   # >= 256 GB RAM machines
+ds4f download q2   # 128 GB RAM machines (~81 GB on disk)
+ds4f download q4   # >= 256 GB RAM machines (~153 GB on disk)
+ds4f download mtp  # optional speculative decoding component (~3.5 GB)
 ```
 
-The Rust downloader uses `hf_hub` against
+The downloader uses `hf_hub` against
 `https://huggingface.co/antirez/deepseek-v4-gguf`, reuses the Hugging Face
 cache for resumable downloads, exposes the selected file under `./gguf/`, and
 updates `./ds4flash.gguf` to point at the selected q2/q4 model. Authentication
 is optional for public downloads, but `--token TOKEN`, `HF_TOKEN`, or the local
 Hugging Face token cache are used when present.
 
-`./download_model.sh mtp` fetches the optional speculative decoding support
-GGUF. It can be used with both q2 and q4, but must be enabled explicitly with
-`--mtp`. The current MTP/speculative decoding path is still experimental: it is
-correctness-gated and currently provides at most a slight speedup, not a
-meaningful generation-speed win.
+The MTP component is optional and must be enabled explicitly with `--mtp`.
+It is useful only for greedy decoding, currently uses a confidence gate
+(`--mtp-margin`) to avoid slow partial accepts, and should be treated as an
+experimental slight-speedup path.
 
-Then build:
+## Build
 
-```sh
-make
-```
-
-## Rust Host Port
-
-The repository now also contains an experimental Cargo workspace that keeps the
-existing native engine and Metal path intact while moving the app layer to
-Rust. The Rust binaries link against the current `ds4.c` engine boundary and
-reuse `ds4_metal.m` plus the `metal/*.metal` kernels unchanged.
-
-Build the Rust binaries with:
+Build `ds4f`:
 
 ```sh
-cargo build --bins
+cargo build --release --bin ds4f
 ```
 
-Or with the Makefile helper:
+Or for a quick development build:
 
 ```sh
-make rust
+cargo build --bin ds4f
 ```
 
-The Rust entrypoints are:
-
-```sh
-cargo run --bin download-model-rs -- q2
-cargo run --bin ds4-rs -- -p "Explain Redis streams in one paragraph."
-cargo run --bin ds4-server-rs -- --ctx 100000
-```
-
-Current Rust scope:
-
-- Reuses the existing `ds4.h` engine/session API and the Metal executor.
-- Ports model downloading to Rust via `download-model-rs`, using `hf_hub` for
-  cached and resumable Hugging Face downloads.
-- Ports pure engine-side helpers to Rust, including DS4 rendered-chat prompt
-  construction, rendered-chat special-token scanning/token assembly,
-  GGUF-backed tokenizer metadata loading, token byte decoding, JoyAI BPE text
-  tokenization, GGUF model summary/inspect parsing, DeepSeek4 metadata
-  validation during engine open, GGUF tensor-directory parsing/range
-  validation, Rust-owned GGUF mmap creation, think-mode gating, and
-  context-memory estimation.
-- Ports the CLI flow to Rust, including one-shot prompts and interactive chat.
-- Ports a basic HTTP server to Rust for `/v1/models`, `/v1/chat/completions`,
-  `/v1/completions`, and `/v1/messages`.
-- Keeps the advanced C server-only features in place for now: DSML tool-schema
-  rendering/parsing, Anthropic/OpenAI streaming parity, and disk KV cache
-  policy remain in `ds4_server.c`.
-- Keeps DS4 weight pointer binding, session sync/eval, and Metal graph
-  execution in `ds4.c` for now.
-
-`./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
-select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
-`./ds4-server --help` for the full flag list.
+The build compiles `ds4.c` (engine core, tokenizer, weight loading) and
+`ds4_metal.m` (Metal kernel dispatch) into a static library. The Metal shaders
+in `metal/*.metal` are compiled at runtime by Metal. No other external
+dependencies are needed beyond the macOS SDK.
 
 ## Speed
 
-These are single-run Metal CLI numbers with `--ctx 32768`, `--nothink`, greedy
+These are single-run Metal numbers with `--ctx 32768`, `--nothink`, greedy
 decoding, and `-n 256`. The short prompt is a normal small Italian story
 prompt. The long prompts exercise chunked prefill plus long-context decode.
 Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
@@ -155,19 +114,19 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
 
-## CLI
+## CLI — `ds4f run`
 
 One-shot prompt:
 
 ```sh
-./ds4 -p "Explain Redis streams in one paragraph."
+ds4f run -p "Explain Redis streams in one paragraph."
 ```
 
-No `-p` starts the interactive prompt:
+No `-p` starts the interactive REPL:
 
 ```sh
-./ds4
-ds4>
+ds4f run
+ds4f>
 ```
 
 The interactive CLI is a real multi-turn DS4 chat. It keeps the rendered chat
@@ -177,27 +136,44 @@ conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 and returns to `ds4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
-answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
-path; it is useful only for greedy decoding, currently uses a confidence gate
-(`--mtp-margin`) to avoid slow partial accepts, and should be treated as an
-experimental slight-speedup path.
+answers.
 
-## Server
+Selected flags:
+
+```
+-m, --model PATH        Model GGUF (default: ds4flash.gguf)
+    --mtp PATH          MTP speculative decoding GGUF
+    --mtp-draft N       Draft tokens per step (default: 1)
+-c, --ctx N             Context size in tokens (default: 32768)
+-p, --prompt TEXT       One-shot prompt
+    --prompt-file PATH  One-shot prompt from file
+-s, --system TEXT       System prompt (default: "You are a helpful assistant")
+-n, --tokens N          Maximum tokens to generate (default: 50000)
+    --temp F            Temperature (default: 1.0)
+    --top-p F           Top-p sampling (default: 1.0)
+    --top-k N           Top-k sampling (default: 0 = disabled)
+    --min-p F           Min-p sampling (default: 0.0)
+    --seed N            RNG seed
+    --nothink           Disable thinking mode
+    --think             Enable thinking mode (default)
+    --think-max         Maximum thinking budget
+    --inspect           Print model summary and exit
+    --dump-tokens       Print tokenized prompt and exit
+    --warm-weights      Pre-warm weight pages before inference
+    --quality           Quality mode (slower but slightly better)
+```
+
+## Server — `ds4f serve`
 
 Start a local OpenAI/Anthropic-compatible server:
 
 ```sh
-./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+ds4f serve --ctx 100000
 ```
 
-The server is Metal-only. It keeps one mutable graph/KV checkpoint in memory,
-so stateless clients that resend a longer version of the same prompt can reuse
-the shared prefix instead of pre-filling from token zero.
-
-Request parsing and sockets run in client threads, but inference itself is
-serialized through one Metal worker. The current server does not batch multiple
-independent requests together; concurrent requests wait their turn on the single
-live graph/session.
+The server is Metal-only. Each request creates a fresh session; there is no
+shared mutable KV state between requests. Request inference is serialized
+through a single Mutex-protected engine.
 
 Supported endpoints:
 
@@ -209,17 +185,13 @@ Supported endpoints:
 
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
-`seed`, `stream`, `stream_options.include_usage`, `tools`, and `tool_choice`.
-Tool schemas are rendered into DeepSeek's DSML tool format, and generated DSML
-tool calls are mapped back to OpenAI tool calls.
+`seed`, and `stream`. The `thinking` field controls thinking mode.
 
-`/v1/messages` is the Anthropic-compatible endpoint used by Claude Code style
-clients. It accepts `system`, `messages`, `tools`, `tool_choice`, `max_tokens`,
-`temperature`, `top_p`, `top_k`, `stream`, `stop_sequences`, and thinking
-controls. Tool uses are returned as Anthropic `tool_use` blocks.
+`/v1/messages` is the Anthropic-compatible endpoint. It accepts `system`,
+`messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, and
+`thinking` controls.
 
-Both APIs support SSE streaming. In thinking mode, reasoning is streamed in the
-native API shape instead of being mixed into final text.
+Both endpoints support SSE streaming.
 
 Minimal OpenAI example:
 
@@ -233,36 +205,32 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-### Agent Client Usage
+Selected flags:
 
-`ds4-server` can be used by local coding agents that speak OpenAI-compatible
-chat completions. Start the server first, and set the client context limit no
-higher than the `--ctx` value you started the server with:
-
-```sh
-./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+```
+-m, --model PATH    Model GGUF (default: ds4flash.gguf)
+    --mtp PATH      MTP speculative decoding GGUF
+-c, --ctx N         Context size in tokens (default: 32768)
+-n, --tokens N      Default max tokens per request (default: 393216)
+    --host ADDR     Listen address (default: 127.0.0.1)
+    --port N        Listen port (default: 8000)
+    --warm-weights  Pre-warm weight pages before serving
+    --quality       Quality mode
 ```
 
-You can use larger context and larger cache if you wish. Full context of
-1M tokens is going to use more or less 26GB of memory (compressed indexer
-alone will be like 22GB), so configure a context which makes sense in
-your system. With 128GB of RAM you would run the 2-bit quants, which are
-already 81GB, 26GB are going to be likely too much, so a context window
-of 100~300k tokens is wiser.
+### Agent Client Configuration
 
-The `384000` output limit below avoids token caps since the model is able
-to generate very long replies otherwise (up to 384k tokens). The server
-still stops when the configured context window is full.
+`ds4f serve` is compatible with local coding agents that speak OpenAI chat
+completions. Configure the context limit to match the `--ctx` value:
 
-For **opencode**, add a provider and agent entry to
-`~/.config/opencode/opencode.json`:
+For **opencode**, add to `~/.config/opencode/opencode.json`:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
     "ds4": {
-      "name": "ds4.c (local)",
+      "name": "ds4 (local)",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "baseURL": "http://127.0.0.1:8000/v1",
@@ -270,7 +238,7 @@ For **opencode**, add a provider and agent entry to
       },
       "models": {
         "deepseek-v4-flash": {
-          "name": "DeepSeek V4 Flash (ds4.c local)",
+          "name": "DeepSeek V4 Flash (ds4 local)",
           "limit": {
             "context": 100000,
             "output": 384000
@@ -281,7 +249,7 @@ For **opencode**, add a provider and agent entry to
   },
   "agent": {
     "ds4": {
-      "description": "DeepSeek V4 Flash served by local ds4-server",
+      "description": "DeepSeek V4 Flash served by local ds4f serve",
       "model": "ds4/deepseek-v4-flash",
       "temperature": 0
     }
@@ -289,13 +257,13 @@ For **opencode**, add a provider and agent entry to
 }
 ```
 
-For **Pi**, add a provider to `~/.pi/agent/models.json`:
+For **Pi**, add to `~/.pi/agent/models.json`:
 
 ```json
 {
   "providers": {
     "ds4": {
-      "name": "ds4.c local",
+      "name": "ds4 local",
       "baseUrl": "http://127.0.0.1:8000/v1",
       "api": "openai-completions",
       "apiKey": "dsv4-local",
@@ -312,7 +280,7 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
       "models": [
         {
           "id": "deepseek-v4-flash",
-          "name": "DeepSeek V4 Flash (ds4.c local)",
+          "name": "DeepSeek V4 Flash (ds4 local)",
           "reasoning": true,
           "thinkingLevelMap": {
             "off": null,
@@ -338,216 +306,31 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
 }
 ```
 
-Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
+## Testing
 
-```json
-{
-  "defaultProvider": "ds4",
-  "defaultModel": "deepseek-v4-flash"
-}
-```
-
-For **Claude Code**, use the Anthropic-compatible endpoint. A wrapper like this
-matches the local `~/bin/claude-ds4` setup:
+Validation uses official logits to check the engine output at the token level:
 
 ```sh
-#!/bin/sh
-unset ANTHROPIC_API_KEY
-
-export ANTHROPIC_BASE_URL="${DS4_ANTHROPIC_BASE_URL:-http://127.0.0.1:8000}"
-export ANTHROPIC_AUTH_TOKEN="${DS4_API_KEY:-dsv4-local}"
-export ANTHROPIC_MODEL="deepseek-v4-flash"
-
-export ANTHROPIC_CUSTOM_MODEL_OPTION="deepseek-v4-flash"
-export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="DeepSeek V4 Flash local ds4"
-export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="ds4.c local GGUF"
-
-export ANTHROPIC_DEFAULT_SONNET_MODEL="deepseek-v4-flash"
-export ANTHROPIC_DEFAULT_HAIKU_MODEL="deepseek-v4-flash"
-export ANTHROPIC_DEFAULT_OPUS_MODEL="deepseek-v4-flash"
-export CLAUDE_CODE_SUBAGENT_MODEL="deepseek-v4-flash"
-
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
-export CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000
-
-exec "$HOME/.local/bin/claude" "$@"
+cargo test
 ```
 
-Claude Code may send a large initial prompt, often around 25k tokens, before it
-starts doing useful work. Keep `--kv-disk-dir` enabled: after the first expensive
-prefill, the disk KV cache lets later continuations or restarted sessions reuse
-the saved prefix instead of processing the whole prompt again.
-
-## Thinking Modes
-
-DeepSeek V4 Flash has distinct non-thinking, thinking, and Think Max modes.
-The server defaults to thinking mode. `reasoning_effort=max` requests Think
-Max, but it is only applied when the context size is large enough for the model
-card recommendation; smaller contexts fall back to normal thinking. OpenAI
-`reasoning_effort=xhigh` still maps to normal thinking, not Think Max.
-
-For direct replies, use `thinking: {"type":"disabled"}`, `think:false`, or a
-non-thinking model alias such as `deepseek-chat`.
-
-## Disk KV Cache
-
-Chat/completion APIs are stateless: agent clients usually resend the whole
-conversation every request. `ds4-server` handles this by comparing the rendered
-token stream with cached token prefixes. The live in-memory checkpoint covers
-the current session; the disk KV cache makes useful prefixes survive session
-switches and server restarts.
-
-For RAM reasons there is currently only one live KV cache in memory. When a new
-unrelated session replaces it, the old checkpoint can only be resumed without
-re-processing if it was written to the disk KV cache. In other words, memory
-cache handles the active session; disk cache is the resume mechanism for
-different sessions.
-
-Enable it with:
+The test vectors live under `tests/test-vectors/`. Fetch the official vectors with:
 
 ```sh
-./ds4-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+python3 tests/test-vectors/fetch_official_vectors.py
 ```
 
-The cache key is the SHA1 of exact token IDs, not raw text. Each token ID is
-hashed as a little-endian 32-bit integer, and files are named `<sha1>.kv`.
-The file is intentionally written with ordinary `read`/`write` I/O, not
-`mmap`, so restoring cache entries does not add more VM mappings to a process
-that already maps the model.
+## Project Structure
 
-On disk, a cache file is:
-
-```text
-KVC fixed header, 48 bytes
-u32 rendered_text_bytes
-rendered_text_bytes of UTF-8-ish token text
-DS4 session payload, payload_bytes from the KVC header
 ```
-
-The fixed header is little-endian:
-
-```text
-0   u8[3]  magic = "KVC"
-3   u8     version = 1
-4   u8     routed expert quant bits, currently 2 or 4
-5   u8     save reason: 0 unknown, 1 cold, 2 continued, 3 evict, 4 shutdown
-6   u8[2]  reserved
-8   u32    cached token count
-12  u32    hit count
-16  u32    context size the snapshot was written for
-20  u8[4]  reserved
-24  u64    creation Unix time
-32  u64    last-used Unix time
-40  u64    DS4 session payload byte count
-```
-
-The rendered text is the tokenizer-decoded text for the cached token prefix.
-It is stored only for observability, so humans can inspect a cache directory
-without decoding token IDs. It is not used as the key and it is not trusted
-when loading; after load, the stored checkpoint tokens must still match the
-incoming request prefix.
-
-The DS4 session payload starts with thirteen little-endian `u32` fields:
-
-```text
-0   magic = "DSV4"
-1   payload version = 1
-2   saved context size
-3   prefill chunk size
-4   raw KV ring capacity
-5   raw sliding-window length
-6   compressed KV capacity
-7   checkpoint token count
-8   layer count
-9   raw/head KV dimension
-10  indexer head dimension
-11  vocabulary size
-12  live raw rows serialized below
-```
-
-Then it stores:
-
-- `u32[token_count]` checkpoint token IDs.
-- `float32[vocab_size]` logits for the next token after that checkpoint.
-- `u32[layer_count]` compressed attention row counts.
-- `u32[layer_count]` ratio-4 indexer row counts.
-- For every layer: the live raw sliding-window KV rows, written in logical
-  position order rather than physical ring order.
-- For compressed layers: live compressed KV rows and compressor frontier
-  tensors.
-- For ratio-4 compressed layers: live indexer compressed rows and indexer
-  frontier tensors.
-
-The logits are raw IEEE-754 `float32` values from the host `ds4_session`
-buffer. They are saved immediately after the checkpoint tokens so a loaded
-snapshot can sample or continue from the exact next-token distribution without
-running one extra decode step. MTP draft logits/state are not persisted; after
-loading a disk checkpoint the draft state is invalidated and rebuilt by normal
-generation.
-
-The tensor payload is DS4-specific KV/session state, not a generic inference
-graph dump. It is expected to be portable only across compatible `ds4.c`
-builds for this model layout.
-
-The cache stores checkpoints at four moments:
-
-- `cold`: after a long first prompt reaches a stable prefix, before generation.
-- `continued`: when prefill or generation advances the live conversation by the configured interval.
-- `evict`: before an unrelated request replaces the live in-memory session.
-- `shutdown`: when the server exits cleanly.
-
-Cold saves intentionally trim a small token suffix and align down to a prefill
-chunk boundary. This avoids common BPE boundary retokenization misses when a
-future request appends text to the same prompt. The defaults are conservative:
-store prefixes of at least 512 tokens, cold-save prompts up to 30000 tokens,
-trim 32 tail tokens, and align to 2048-token chunks. The important knobs are:
-
-- `--kv-cache-min-tokens`
-- `--kv-cache-cold-max-tokens`
-- `--kv-cache-continued-interval-tokens`
-- `--kv-cache-boundary-trim-tokens`
-- `--kv-cache-boundary-align-tokens`
-
-By default, checkpoints may be reused across the 2-bit and 4-bit routed-expert
-variants if the token prefix matches. Use `--kv-cache-reject-different-quant`
-when you want strict same-quant reuse only.
-
-The cache directory is disposable. If behavior looks suspicious, stop the
-server and remove it. You can investigate what is cached with hexdump as
-the kv cache files include the verbatim prompt cached.
-
-## Backends
-
-The default backend is Metal:
-
-```sh
-./ds4 -p "Hello" --metal
-```
-
-There is also a CPU reference/debug path:
-
-```sh
-./ds4 -p "Hello" --cpu
-```
-
-Do not treat the CPU path as the production target. The server is Metal-only,
-and the optimized implementation lives in the Metal graph path. This may
-change in the future.
-
-## Test Vectors
-
-`tests/test-vectors` contains short and long-context continuation vectors
-captured from the official DeepSeek V4 Flash API. The requests use
-`deepseek-v4-flash`, greedy decoding, thinking disabled, and the maximum
-`top_logprobs` slice exposed by the API. Local vectors are generated with
-`./ds4 --dump-logprobs` and compared by token bytes, so tokenizer/template or
-attention regressions show up before they become long generation failures.
-
-All project tests are driven by the C runner:
-
-```sh
-make test                  # ./ds4_test --all
-./ds4_test --logprob-vectors
-./ds4_test --server
+ds4.c              Engine core: weight loading, tokenizer, MTP, GGUF mmap
+ds4.h              Public C API
+ds4_metal.m        Metal kernel dispatch
+ds4_metal.h        Metal dispatch header
+metal/*.metal      Metal compute shaders
+src/lib.rs         Rust library: session, inference loop, sampling, chat prompt rendering
+src/bin/ds4f.rs    Unified CLI: ds4f run / ds4f serve / ds4f download
+src/ffi.rs         Rust FFI bindings for ds4.c and Metal
+src/gguf.rs        Rust GGUF parser
+build.rs           Compiles ds4.c and ds4_metal.m into libds4ffi.a
 ```

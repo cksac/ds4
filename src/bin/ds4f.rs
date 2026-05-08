@@ -1,8 +1,8 @@
 // ds4f — unified CLI for DeepSeek V4 Flash
 //
-//   ds4f run      interactive / one-shot chat (was ds4-rs)
-//   ds4f serve    OpenAI-compatible HTTP server (was ds4-server-rs)
-//   ds4f download fetch GGUF files from Hugging Face (was download-model-rs)
+//   ds4f run      interactive / one-shot chat
+//   ds4f serve    OpenAI-compatible HTTP server
+//   ds4f download fetch GGUF files from Hugging Face
 
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -22,9 +22,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand, ValueEnum};
 use ds4_rust::{
-    build_chat_generation_prompt, ensure_supported_role, generate, generate_rust,
+    build_chat_generation_prompt, ensure_supported_role, generate_rust,
     is_rendered_chat_prompt, mib_string, Backend, ChatMessage, Engine, EngineOptions,
-    GenerationOptions, RustSession, Session, ThinkMode,
+    GenerationOptions, RustSession, ThinkMode,
 };
 use futures_util::stream;
 use hf_hub::api::sync::ApiBuilder;
@@ -58,7 +58,7 @@ enum Subcommands {
 }
 
 // ---------------------------------------------------------------------------
-// Shared backend arg
+// Shared backend arg (Metal for inference; Cpu retained for correctness checks)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -129,8 +129,6 @@ struct RunArgs {
     inspect: bool,
     #[arg(long = "dump-tokens", default_value_t = false)]
     dump_tokens: bool,
-    #[arg(long = "rust-session", default_value_t = false)]
-    rust_session: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -162,8 +160,6 @@ struct ServeArgs {
     quality: bool,
     #[arg(long = "warm-weights", default_value_t = false)]
     warm_weights: bool,
-    #[arg(long = "rust-session", default_value_t = false)]
-    rust_session: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,14 +228,8 @@ struct ReplState {
     ctx_size: i32,
 }
 
-enum CliSession<'a> {
-    Ffi(Session),
-    Rust(RustSession<'a>),
-}
-
 fn run_cmd(args: RunArgs) -> Result<()> {
-    let requested_backend: Backend = args.backend.into();
-    let backend = requested_backend; // no remapping needed
+    let backend: Backend = args.backend.into();
     let think_mode = if args.nothink {
         ThinkMode::None
     } else if args.think_max {
@@ -307,28 +297,19 @@ fn run_generation_options(args: &RunArgs) -> GenerationOptions {
     }
 }
 
-fn run_think_mode(think_mode: ThinkMode, ctx_size: i32) -> ThinkMode {
-    think_mode.for_context(ctx_size)
-}
-
 fn run_one_shot(engine: &Engine, args: &RunArgs, think_mode: ThinkMode, prompt: &str) -> Result<()> {
+    let backend: Backend = args.backend.into();
     let prompt_tokens = if is_rendered_chat_prompt(prompt) {
         engine.tokenize_rendered_chat(prompt)?
     } else {
-        engine.encode_chat_prompt(
-            Some(&args.system),
-            prompt,
-            run_think_mode(think_mode, args.ctx_size),
-        )?
+        engine.encode_chat_prompt(Some(&args.system), prompt, think_mode.for_context(args.ctx_size))?
     };
-
     if args.dump_tokens {
         engine.dump_tokens(&prompt_tokens);
     }
-
-    let backend: Backend = args.backend.into();
-    let mut session = create_cli_session(engine, args.ctx_size, backend, args.rust_session)?;
-    let result = do_generate(engine, &mut session, &prompt_tokens, run_generation_options(args))?;
+    let memory = Engine::context_memory_estimate(backend, args.ctx_size);
+    let mut session = engine.create_rust_session(args.ctx_size as u32, memory.raw_cap);
+    let result = generate_rust(engine, &mut session, &prompt_tokens, run_generation_options(args))?;
     io::stdout().write_all(&result.bytes)?;
     if !result.bytes.ends_with(b"\n") {
         println!();
@@ -354,7 +335,8 @@ fn run_repl<'a>(engine: &'a Engine, args: &RunArgs, think_mode: ThinkMode) -> Re
         ctx_size: args.ctx_size,
     };
     let backend: Backend = args.backend.into();
-    let mut session = create_cli_session(engine, state.ctx_size, backend, args.rust_session)?;
+    let memory = Engine::context_memory_estimate(backend, args.ctx_size);
+    let mut session = engine.create_rust_session(args.ctx_size as u32, memory.raw_cap);
     let stdin = io::stdin();
     let mut locked = stdin.lock();
 
@@ -371,16 +353,7 @@ fn run_repl<'a>(engine: &'a Engine, args: &RunArgs, think_mode: ThinkMode) -> Re
             continue;
         }
 
-        if handle_repl_command(
-            engine,
-            &mut session,
-            &mut state,
-            &line,
-            run_generation_options(args),
-            backend,
-            args.rust_session,
-            interrupted.as_ref(),
-        )? {
+        if handle_repl_command(engine, &mut session, &mut state, &line, run_generation_options(args), args, &interrupted)? {
             continue;
         }
         if line == "/quit" || line == "/exit" {
@@ -388,22 +361,9 @@ fn run_repl<'a>(engine: &'a Engine, args: &RunArgs, think_mode: ThinkMode) -> Re
         }
 
         interrupted.store(false, Ordering::SeqCst);
-        let response = run_chat_turn(
-            engine,
-            &mut session,
-            &state,
-            run_generation_options(args),
-            &line,
-            &interrupted,
-        )?;
-        state.messages.push(ChatMessage {
-            role: "user".to_owned(),
-            content: line,
-        });
-        state.messages.push(ChatMessage {
-            role: "assistant".to_owned(),
-            content: response,
-        });
+        let response = run_chat_turn(engine, &mut session, &state, run_generation_options(args), &line, &interrupted)?;
+        state.messages.push(ChatMessage { role: "user".to_owned(), content: line });
+        state.messages.push(ChatMessage { role: "assistant".to_owned(), content: response });
     }
 
     Ok(())
@@ -411,12 +371,11 @@ fn run_repl<'a>(engine: &'a Engine, args: &RunArgs, think_mode: ThinkMode) -> Re
 
 fn handle_repl_command<'a>(
     engine: &'a Engine,
-    session: &mut CliSession<'a>,
+    session: &mut RustSession<'a>,
     state: &mut ReplState,
     line: &str,
     options: GenerationOptions,
-    backend: Backend,
-    use_rust_session: bool,
+    args: &RunArgs,
     interrupted: &AtomicBool,
 ) -> Result<bool> {
     if line == "/help" {
@@ -440,7 +399,9 @@ fn handle_repl_command<'a>(
     }
     if let Some(rest) = line.strip_prefix("/ctx ") {
         let ctx_size: i32 = rest.trim().parse().context("invalid /ctx value")?;
-        *session = create_cli_session(engine, ctx_size, backend, use_rust_session)?;
+        let backend: Backend = args.backend.into();
+        let memory = Engine::context_memory_estimate(backend, ctx_size);
+        *session = engine.create_rust_session(ctx_size as u32, memory.raw_cap);
         state.ctx_size = ctx_size;
         println!("context size: {ctx_size}");
         return Ok(true);
@@ -448,16 +409,9 @@ fn handle_repl_command<'a>(
     if let Some(path) = line.strip_prefix("/read ") {
         let contents = fs::read_to_string(path.trim())
             .with_context(|| format!("failed to read {}", path.trim()))?;
-        let response =
-            run_chat_turn(engine, session, state, options, &contents, interrupted)?;
-        state.messages.push(ChatMessage {
-            role: "user".to_owned(),
-            content: contents,
-        });
-        state.messages.push(ChatMessage {
-            role: "assistant".to_owned(),
-            content: response,
-        });
+        let response = run_chat_turn(engine, session, state, options, &contents, interrupted)?;
+        state.messages.push(ChatMessage { role: "user".to_owned(), content: contents });
+        state.messages.push(ChatMessage { role: "assistant".to_owned(), content: response });
         return Ok(true);
     }
     Ok(false)
@@ -465,63 +419,27 @@ fn handle_repl_command<'a>(
 
 fn run_chat_turn(
     engine: &Engine,
-    session: &mut CliSession<'_>,
+    session: &mut RustSession<'_>,
     state: &ReplState,
     options: GenerationOptions,
     user_text: &str,
-    interrupted: &AtomicBool,
+    _interrupted: &AtomicBool,
 ) -> Result<String> {
     let mut messages = state.messages.clone();
-    messages.push(ChatMessage {
-        role: "user".to_owned(),
-        content: user_text.to_owned(),
-    });
+    messages.push(ChatMessage { role: "user".to_owned(), content: user_text.to_owned() });
     let prompt = build_chat_generation_prompt(
         engine,
         Some(&state.system),
         &messages,
-        run_think_mode(state.think_mode, state.ctx_size),
+        state.think_mode.for_context(state.ctx_size),
     )?;
-    let result = if interrupted.load(Ordering::SeqCst) {
-        interrupted.store(false, Ordering::SeqCst);
-        do_generate(engine, session, &prompt, options)?
-    } else {
-        do_generate(engine, session, &prompt, options)?
-    };
+    let result = generate_rust(engine, session, &prompt, options)?;
     io::stdout().write_all(&result.bytes)?;
     if !result.bytes.ends_with(b"\n") {
         println!();
     }
     log_run_stats(prompt.len(), &result);
     Ok(result.text_lossy())
-}
-
-fn create_cli_session<'a>(
-    engine: &'a Engine,
-    ctx_size: i32,
-    backend: Backend,
-    use_rust_session: bool,
-) -> Result<CliSession<'a>> {
-    if use_rust_session {
-        let memory = Engine::context_memory_estimate(backend, ctx_size);
-        Ok(CliSession::Rust(
-            engine.create_rust_session(ctx_size as u32, memory.raw_cap),
-        ))
-    } else {
-        Ok(CliSession::Ffi(Session::create(engine, ctx_size)?))
-    }
-}
-
-fn do_generate(
-    engine: &Engine,
-    session: &mut CliSession<'_>,
-    prompt: &ds4_rust::Tokens,
-    options: GenerationOptions,
-) -> Result<ds4_rust::GenerationResult> {
-    match session {
-        CliSession::Ffi(s) => generate(engine, s, prompt, options),
-        CliSession::Rust(s) => generate_rust(engine, s, prompt, options),
-    }
 }
 
 fn log_run_stats(prompt_len: i32, result: &ds4_rust::GenerationResult) {
@@ -535,10 +453,7 @@ fn log_run_stats(prompt_len: i32, result: &ds4_rust::GenerationResult) {
     } else {
         0.0
     };
-    eprintln!(
-        "ds4f run: prefill: {:.2} t/s, generation: {:.2} t/s",
-        prefill_tps, decode_tps
-    );
+    eprintln!("ds4f run: prefill: {:.2} t/s, generation: {:.2} t/s", prefill_tps, decode_tps);
 }
 
 // ===========================================================================
@@ -547,12 +462,10 @@ fn log_run_stats(prompt_len: i32, result: &ds4_rust::GenerationResult) {
 
 #[derive(Debug)]
 struct ServeRuntime {
-    session: Option<Session>,
     engine: Engine,
     ctx_size: i32,
     raw_cap: u32,
     default_tokens: i32,
-    rust_session: bool,
 }
 
 unsafe impl Send for ServeRuntime {}
@@ -617,7 +530,7 @@ struct AnthropicRequest {
 }
 
 async fn serve_cmd(args: ServeArgs) -> Result<()> {
-    let backend = Backend::Metal; // serve always uses Metal
+    let backend = Backend::Metal;
     let memory = Engine::context_memory_estimate(backend, args.ctx_size);
     eprintln!(
         "ds4f serve: context buffers {:.2} MiB (ctx={}, backend={}, prefill_chunk={}, raw_kv_rows={}, compressed_kv_rows={})",
@@ -640,19 +553,11 @@ async fn serve_cmd(args: ServeArgs) -> Result<()> {
         quality: args.quality,
     })?;
 
-    let session = if args.rust_session {
-        None
-    } else {
-        Some(Session::create(&engine, args.ctx_size)?)
-    };
-
     let state = Arc::new(Mutex::new(ServeRuntime {
-        session,
         engine,
         ctx_size: args.ctx_size,
         raw_cap: memory.raw_cap,
         default_tokens: args.default_tokens,
-        rust_session: args.rust_session,
     }));
 
     let app = Router::new()
@@ -673,10 +578,7 @@ async fn serve_cmd(args: ServeArgs) -> Result<()> {
 }
 
 async fn list_models() -> Json<Value> {
-    Json(json!({
-        "object": "list",
-        "data": [model_json()],
-    }))
+    Json(json!({ "object": "list", "data": [model_json()] }))
 }
 
 async fn get_model() -> Json<Value> {
@@ -688,17 +590,13 @@ async fn chat_completions(
     Json(request): Json<OpenAiChatRequest>,
 ) -> Response {
     if request.tools.is_some() || request.tool_choice.is_some() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "ds4f serve does not support tool schemas yet",
-        );
+        return error_response(StatusCode::BAD_REQUEST, "tool schemas not supported yet");
     }
     let stream = request.stream.unwrap_or(false);
-    let result =
-        match tokio::task::spawn_blocking(move || generate_openai_chat(state, request)).await {
-            Ok(result) => result,
-            Err(err) => Err(anyhow!(err)),
-        };
+    let result = match tokio::task::spawn_blocking(move || generate_openai_chat(state, request)).await {
+        Ok(result) => result,
+        Err(err) => Err(anyhow!(err)),
+    };
     match result {
         Ok(payload) if !stream => Json(payload).into_response(),
         Ok(payload) => openai_stream_response(payload),
@@ -711,11 +609,10 @@ async fn completions(
     Json(request): Json<CompletionRequest>,
 ) -> Response {
     let stream = request.stream.unwrap_or(false);
-    let result =
-        match tokio::task::spawn_blocking(move || generate_completion(state, request)).await {
-            Ok(result) => result,
-            Err(err) => Err(anyhow!(err)),
-        };
+    let result = match tokio::task::spawn_blocking(move || generate_completion(state, request)).await {
+        Ok(result) => result,
+        Err(err) => Err(anyhow!(err)),
+    };
     match result {
         Ok(payload) if !stream => Json(payload).into_response(),
         Ok(payload) => openai_stream_response(payload),
@@ -728,17 +625,13 @@ async fn messages(
     Json(request): Json<AnthropicRequest>,
 ) -> Response {
     if request.tools.is_some() || request.tool_choice.is_some() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "ds4f serve does not support tool schemas yet",
-        );
+        return error_response(StatusCode::BAD_REQUEST, "tool schemas not supported yet");
     }
     let stream = request.stream.unwrap_or(false);
-    let result =
-        match tokio::task::spawn_blocking(move || generate_anthropic(state, request)).await {
-            Ok(result) => result,
-            Err(err) => Err(anyhow!(err)),
-        };
+    let result = match tokio::task::spawn_blocking(move || generate_anthropic(state, request)).await {
+        Ok(result) => result,
+        Err(err) => Err(anyhow!(err)),
+    };
     match result {
         Ok(payload) if !stream => Json(payload).into_response(),
         Ok(payload) => anthropic_stream_response(payload),
@@ -747,32 +640,15 @@ async fn messages(
 }
 
 fn generate_openai_chat(state: SharedRuntime, request: OpenAiChatRequest) -> Result<Value> {
-    let model = request
-        .model
-        .unwrap_or_else(|| "deepseek-v4-flash".to_owned());
+    let model = request.model.unwrap_or_else(|| "deepseek-v4-flash".to_owned());
     let think_mode = think_mode_from_value(request.thinking.as_ref());
-    let messages = request
-        .messages
-        .into_iter()
-        .map(|message| {
-            ensure_supported_role(&message.role)?;
-            Ok(ChatMessage {
-                role: message.role,
-                content: content_to_text(&message.content)?,
-            })
-        })
+    let messages = request.messages.into_iter()
+        .map(|m| { ensure_supported_role(&m.role)?; Ok(ChatMessage { role: m.role, content: content_to_text(&m.content)? }) })
         .collect::<Result<Vec<_>>>()?;
-    let max_tokens = request
-        .max_completion_tokens
-        .or(request.max_tokens)
+    let max_tokens = request.max_completion_tokens.or(request.max_tokens)
         .unwrap_or_else(|| state.lock().expect("runtime poisoned").default_tokens);
-    let generated = with_runtime(&state, |runtime| {
-        let prompt = build_chat_generation_prompt(
-            &runtime.engine,
-            None,
-            &messages,
-            think_mode.for_context(runtime.ctx_size),
-        )?;
+    let generated = with_runtime(&state, |rt| {
+        let prompt = build_chat_generation_prompt(&rt.engine, None, &messages, think_mode.for_context(rt.ctx_size))?;
         let options = GenerationOptions {
             max_tokens,
             temperature: request.temperature.unwrap_or(1.0),
@@ -781,135 +657,85 @@ fn generate_openai_chat(state: SharedRuntime, request: OpenAiChatRequest) -> Res
             min_p: request.min_p.unwrap_or(0.0),
             seed: request.seed,
         };
-        let result = generate_runtime(runtime, &prompt, options)?;
+        let result = serve_generate(rt, &prompt, options)?;
         Ok((prompt.len(), result.text_lossy(), result.completion_tokens))
     })?;
     Ok(json!({
-        "id": request_id("chatcmpl"),
-        "object": "chat.completion",
-        "created": unix_time(),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": generated.1},
-            "finish_reason": "stop"
-        }],
+        "id": request_id("chatcmpl"), "object": "chat.completion",
+        "created": unix_time(), "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": generated.1}, "finish_reason": "stop"}],
         "usage": usage_json(generated.0, generated.2),
     }))
 }
 
 fn generate_completion(state: SharedRuntime, request: CompletionRequest) -> Result<Value> {
-    let model = request
-        .model
-        .unwrap_or_else(|| "deepseek-v4-flash".to_owned());
-    let generated = with_runtime(&state, |runtime| {
+    let model = request.model.unwrap_or_else(|| "deepseek-v4-flash".to_owned());
+    let generated = with_runtime(&state, |rt| {
         let prompt = if is_rendered_chat_prompt(&request.prompt) {
-            runtime.engine.tokenize_rendered_chat(&request.prompt)?
+            rt.engine.tokenize_rendered_chat(&request.prompt)?
         } else {
-            runtime.engine.tokenize_text(&request.prompt)?
+            rt.engine.tokenize_text(&request.prompt)?
         };
         let options = GenerationOptions {
-            max_tokens: request.max_tokens.unwrap_or(runtime.default_tokens),
+            max_tokens: request.max_tokens.unwrap_or(rt.default_tokens),
             temperature: request.temperature.unwrap_or(1.0),
             top_k: request.top_k.unwrap_or(0),
             top_p: request.top_p.unwrap_or(1.0),
             min_p: request.min_p.unwrap_or(0.0),
             seed: request.seed,
         };
-        let result = generate_runtime(runtime, &prompt, options)?;
+        let result = serve_generate(rt, &prompt, options)?;
         Ok((prompt.len(), result.text_lossy(), result.completion_tokens))
     })?;
     Ok(json!({
-        "id": request_id("cmpl"),
-        "object": "text_completion",
-        "created": unix_time(),
-        "model": model,
+        "id": request_id("cmpl"), "object": "text_completion",
+        "created": unix_time(), "model": model,
         "choices": [{"index": 0, "text": generated.1, "finish_reason": "stop"}],
         "usage": usage_json(generated.0, generated.2),
     }))
 }
 
 fn generate_anthropic(state: SharedRuntime, request: AnthropicRequest) -> Result<Value> {
-    let model = request
-        .model
-        .unwrap_or_else(|| "deepseek-v4-flash".to_owned());
+    let model = request.model.unwrap_or_else(|| "deepseek-v4-flash".to_owned());
     let think_mode = think_mode_from_value(request.thinking.as_ref());
     let system = request.system.as_ref().map(content_to_text).transpose()?;
-    let messages = request
-        .messages
-        .into_iter()
-        .map(|message| {
-            ensure_supported_role(&message.role)?;
-            Ok(ChatMessage {
-                role: message.role,
-                content: content_to_text(&message.content)?,
-            })
-        })
+    let messages = request.messages.into_iter()
+        .map(|m| { ensure_supported_role(&m.role)?; Ok(ChatMessage { role: m.role, content: content_to_text(&m.content)? }) })
         .collect::<Result<Vec<_>>>()?;
-    let generated = with_runtime(&state, |runtime| {
-        let prompt = build_chat_generation_prompt(
-            &runtime.engine,
-            system.as_deref(),
-            &messages,
-            think_mode.for_context(runtime.ctx_size),
-        )?;
+    let generated = with_runtime(&state, |rt| {
+        let prompt = build_chat_generation_prompt(&rt.engine, system.as_deref(), &messages, think_mode.for_context(rt.ctx_size))?;
         let options = GenerationOptions {
             max_tokens: request.max_tokens,
             temperature: request.temperature.unwrap_or(1.0),
             top_k: request.top_k.unwrap_or(0),
             top_p: request.top_p.unwrap_or(1.0),
-            min_p: 0.0,
-            seed: None,
+            min_p: 0.0, seed: None,
         };
-        let result = generate_runtime(runtime, &prompt, options)?;
+        let result = serve_generate(rt, &prompt, options)?;
         Ok((prompt.len(), result.text_lossy(), result.completion_tokens))
     })?;
     Ok(json!({
-        "id": request_id("msg"),
-        "type": "message",
-        "role": "assistant",
-        "model": model,
+        "id": request_id("msg"), "type": "message", "role": "assistant", "model": model,
         "content": [{"type": "text", "text": generated.1}],
         "stop_reason": "end_turn",
-        "usage": {
-            "input_tokens": generated.0,
-            "output_tokens": generated.2,
-        }
+        "usage": {"input_tokens": generated.0, "output_tokens": generated.2},
     }))
 }
 
-fn with_runtime<T>(
-    state: &SharedRuntime,
-    f: impl FnOnce(&mut ServeRuntime) -> Result<T>,
-) -> Result<T> {
-    let mut runtime = state.lock().map_err(|_| anyhow!("runtime poisoned"))?;
-    f(&mut runtime)
+fn with_runtime<T>(state: &SharedRuntime, f: impl FnOnce(&mut ServeRuntime) -> Result<T>) -> Result<T> {
+    let mut rt = state.lock().map_err(|_| anyhow!("runtime poisoned"))?;
+    f(&mut rt)
 }
 
-fn generate_runtime(
-    runtime: &mut ServeRuntime,
-    prompt: &ds4_rust::Tokens,
-    options: GenerationOptions,
-) -> Result<ds4_rust::GenerationResult> {
-    if runtime.rust_session {
-        let mut session = runtime
-            .engine
-            .create_rust_session(runtime.ctx_size as u32, runtime.raw_cap);
-        generate_rust(&runtime.engine, &mut session, prompt, options)
-    } else {
-        let session = runtime.session.as_mut().context("missing FFI session")?;
-        generate(&runtime.engine, session, prompt, options)
-    }
+fn serve_generate(rt: &mut ServeRuntime, prompt: &ds4_rust::Tokens, options: GenerationOptions) -> Result<ds4_rust::GenerationResult> {
+    let mut session = rt.engine.create_rust_session(rt.ctx_size as u32, rt.raw_cap);
+    generate_rust(&rt.engine, &mut session, prompt, options)
 }
 
 fn think_mode_from_value(value: Option<&Value>) -> ThinkMode {
     match value {
         Some(Value::Bool(false)) => ThinkMode::None,
-        Some(Value::Object(map))
-            if map.get("enabled") == Some(&Value::Bool(false)) =>
-        {
-            ThinkMode::None
-        }
+        Some(Value::Object(map)) if map.get("enabled") == Some(&Value::Bool(false)) => ThinkMode::None,
         _ => ThinkMode::High,
     }
 }
@@ -921,12 +747,10 @@ fn content_to_text(value: &Value) -> Result<String> {
             let mut parts = Vec::new();
             for block in blocks {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    parts.push(text.to_owned());
-                    continue;
+                    parts.push(text.to_owned()); continue;
                 }
                 if let Some(text) = block.get("content").and_then(Value::as_str) {
-                    parts.push(text.to_owned());
-                    continue;
+                    parts.push(text.to_owned()); continue;
                 }
                 bail!("unsupported content block")
             }
@@ -938,139 +762,48 @@ fn content_to_text(value: &Value) -> Result<String> {
 }
 
 fn model_json() -> Value {
-    json!({
-        "id": "deepseek-v4-flash",
-        "object": "model",
-        "owned_by": "ds4f"
-    })
+    json!({ "id": "deepseek-v4-flash", "object": "model", "owned_by": "ds4f" })
 }
 
 fn usage_json(prompt_tokens: i32, completion_tokens: i32) -> Value {
-    json!({
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-    })
+    json!({ "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens })
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        Json(json!({"error": {"message": message}})),
-    )
-        .into_response()
+    (status, Json(json!({"error": {"message": message}}))).into_response()
 }
 
 fn openai_stream_response(payload: Value) -> Response {
-    let model = payload
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("deepseek-v4-flash")
-        .to_owned();
-    let id = payload
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("chatcmpl-rs")
-        .to_owned();
-    let text = payload["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_owned();
-    let created = payload
-        .get("created")
-        .and_then(Value::as_i64)
-        .unwrap_or(unix_time() as i64);
+    let model = payload.get("model").and_then(Value::as_str).unwrap_or("deepseek-v4-flash").to_owned();
+    let id = payload.get("id").and_then(Value::as_str).unwrap_or("chatcmpl-rs").to_owned();
+    let text = payload["choices"][0]["message"]["content"].as_str().unwrap_or("").to_owned();
+    let created = payload.get("created").and_then(Value::as_i64).unwrap_or(unix_time() as i64);
     let events: Vec<Result<Event, std::convert::Infallible>> = vec![
-        Ok(Event::default().data(
-            json!({
-                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
-            })
-            .to_string(),
-        )),
-        Ok(Event::default().data(
-            json!({
-                "id": payload["id"], "object": "chat.completion.chunk",
-                "created": created, "model": payload["model"],
-                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}],
-            })
-            .to_string(),
-        )),
-        Ok(Event::default().data(
-            json!({
-                "id": payload["id"], "object": "chat.completion.chunk",
-                "created": created, "model": payload["model"],
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            })
-            .to_string(),
-        )),
+        Ok(Event::default().data(json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]}).to_string())),
+        Ok(Event::default().data(json!({"id": payload["id"], "object": "chat.completion.chunk", "created": created, "model": payload["model"], "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]}).to_string())),
+        Ok(Event::default().data(json!({"id": payload["id"], "object": "chat.completion.chunk", "created": created, "model": payload["model"], "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}).to_string())),
         Ok(Event::default().data("[DONE]")),
     ];
-    Sse::new(stream::iter(events))
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    Sse::new(stream::iter(events)).keep_alive(KeepAlive::default()).into_response()
 }
 
 fn anthropic_stream_response(payload: Value) -> Response {
-    let id = payload
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("msg-rs")
-        .to_owned();
-    let model = payload
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("deepseek-v4-flash")
-        .to_owned();
-    let text = payload["content"][0]["text"]
-        .as_str()
-        .unwrap_or("")
-        .to_owned();
+    let id = payload.get("id").and_then(Value::as_str).unwrap_or("msg-rs").to_owned();
+    let model = payload.get("model").and_then(Value::as_str).unwrap_or("deepseek-v4-flash").to_owned();
+    let text = payload["content"][0]["text"].as_str().unwrap_or("").to_owned();
     let events: Vec<Result<Event, std::convert::Infallible>> = vec![
-        Ok(Event::default().event("message_start").data(
-            json!({
-                "type": "message_start",
-                "message": {
-                    "id": id, "type": "message", "role": "assistant", "model": model,
-                    "content": [], "stop_reason": null, "stop_sequence": null,
-                    "usage": {"input_tokens": payload["usage"]["input_tokens"], "output_tokens": 0}
-                }
-            })
-            .to_string(),
-        )),
-        Ok(Event::default().event("content_block_start").data(
-            json!({"type": "content_block_start", "index": 0,
-                   "content_block": {"type": "text", "text": ""}})
-            .to_string(),
-        )),
-        Ok(Event::default().event("content_block_delta").data(
-            json!({"type": "content_block_delta", "index": 0,
-                   "delta": {"type": "text_delta", "text": text}})
-            .to_string(),
-        )),
-        Ok(Event::default()
-            .event("content_block_stop")
-            .data(json!({"type": "content_block_stop", "index": 0}).to_string())),
-        Ok(Event::default().event("message_delta").data(
-            json!({"type": "message_delta",
-                   "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-                   "usage": {"output_tokens": payload["usage"]["output_tokens"]}})
-            .to_string(),
-        )),
-        Ok(Event::default()
-            .event("message_stop")
-            .data(json!({"type": "message_stop"}).to_string())),
+        Ok(Event::default().event("message_start").data(json!({"type": "message_start", "message": {"id": id, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": payload["usage"]["input_tokens"], "output_tokens": 0}}}).to_string())),
+        Ok(Event::default().event("content_block_start").data(json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}).to_string())),
+        Ok(Event::default().event("content_block_delta").data(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}).to_string())),
+        Ok(Event::default().event("content_block_stop").data(json!({"type": "content_block_stop", "index": 0}).to_string())),
+        Ok(Event::default().event("message_delta").data(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": payload["usage"]["output_tokens"]}}).to_string())),
+        Ok(Event::default().event("message_stop").data(json!({"type": "message_stop"}).to_string())),
     ];
-    Sse::new(stream::iter(events))
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    Sse::new(stream::iter(events)).keep_alive(KeepAlive::default()).into_response()
 }
 
 fn unix_time() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn request_id(prefix: &str) -> String {
@@ -1082,18 +815,14 @@ fn request_id(prefix: &str) -> String {
 // ===========================================================================
 
 fn download_cmd(args: DownloadArgs) -> Result<()> {
-    let token = args
-        .token
-        .or_else(hf_token_from_env)
-        .or_else(read_local_hf_token);
+    let token = args.token.or_else(hf_token_from_env).or_else(read_local_hf_token);
     let api = build_hf_api(token)?;
     let repo = api.model(REPO.to_owned());
     let filename = args.model.filename();
 
     println!("Downloading {filename}");
     println!("from https://huggingface.co/{REPO}");
-    let cached_path = repo
-        .get(filename)
+    let cached_path = repo.get(filename)
         .with_context(|| format!("failed to fetch {filename} from Hugging Face"))?;
 
     let repo_entry = ensure_repo_entry(filename, &cached_path)?;
@@ -1122,16 +851,11 @@ fn build_hf_api(token: Option<String>) -> Result<hf_hub::api::sync::Api> {
     if let Some(token) = token {
         builder = builder.with_token(Some(token));
     }
-    builder
-        .build()
-        .context("failed to initialize Hugging Face API client")
+    builder.build().context("failed to initialize Hugging Face API client")
 }
 
 fn hf_token_from_env() -> Option<String> {
-    env::var("HF_TOKEN")
-        .ok()
-        .map(|token| token.trim().to_owned())
-        .filter(|token| !token.is_empty())
+    env::var("HF_TOKEN").ok().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty())
 }
 
 fn read_local_hf_token() -> Option<String> {
@@ -1139,11 +863,7 @@ fn read_local_hf_token() -> Option<String> {
     let token_path = PathBuf::from(home).join(".cache/huggingface/token");
     let token = fs::read_to_string(token_path).ok()?;
     let token = token.trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_owned())
-    }
+    if token.is_empty() { None } else { Some(token.to_owned()) }
 }
 
 fn repo_root() -> PathBuf {
@@ -1153,36 +873,21 @@ fn repo_root() -> PathBuf {
 fn ensure_repo_entry(filename: &str, cached_path: &Path) -> Result<PathBuf> {
     let repo_entry = repo_root().join("gguf").join(filename);
     fs::create_dir_all(repo_entry.parent().expect("gguf output dir"))
-        .with_context(|| {
-            format!(
-                "failed to create {}",
-                repo_entry.parent().unwrap().display()
-            )
-        })?;
+        .with_context(|| format!("failed to create {}", repo_entry.parent().unwrap().display()))?;
 
     if path_present(&repo_entry) {
         if repo_entry.exists() {
             println!("Already available: {}", repo_entry.display());
             return Ok(repo_entry);
         }
-        fs::remove_file(&repo_entry).with_context(|| {
-            format!("failed to remove broken link {}", repo_entry.display())
-        })?;
+        fs::remove_file(&repo_entry)
+            .with_context(|| format!("failed to remove broken link {}", repo_entry.display()))?;
     }
 
-    let cached_path = fs::canonicalize(cached_path).with_context(|| {
-        format!(
-            "failed to resolve Hugging Face cache path {}",
-            cached_path.display()
-        )
-    })?;
-    create_symlink(&cached_path, &repo_entry).with_context(|| {
-        format!(
-            "failed to link {} to {}",
-            repo_entry.display(),
-            cached_path.display()
-        )
-    })?;
+    let cached_path = fs::canonicalize(cached_path)
+        .with_context(|| format!("failed to resolve Hugging Face cache path {}", cached_path.display()))?;
+    create_symlink(&cached_path, &repo_entry)
+        .with_context(|| format!("failed to link {} to {}", repo_entry.display(), cached_path.display()))?;
     Ok(repo_entry)
 }
 
@@ -1193,13 +898,8 @@ fn update_default_model_link(filename: &str) -> Result<()> {
             .with_context(|| format!("failed to replace {}", link_path.display()))?;
     }
     let relative_target = PathBuf::from("gguf").join(filename);
-    create_symlink(&relative_target, &link_path).with_context(|| {
-        format!(
-            "failed to link {} to {}",
-            link_path.display(),
-            relative_target.display()
-        )
-    })
+    create_symlink(&relative_target, &link_path)
+        .with_context(|| format!("failed to link {} to {}", link_path.display(), relative_target.display()))
 }
 
 fn path_present(path: &Path) -> bool {
