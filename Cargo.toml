@@ -20,6 +20,10 @@ path = "src/bin/ds4-server.rs"
 name = "download-model-rs"
 path = "src/bin/download-model.rs"
 
+[[bin]]
+name = "ds4f"
+path = "src/bin/ds4f.rs"
+
 [dependencies]
 anyhow = "1"
 axum = { version = "0.7", features = ["http1", "json", "tokio"] }
