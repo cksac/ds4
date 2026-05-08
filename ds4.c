@@ -896,6 +896,7 @@ typedef struct {
     int fd;
     const uint8_t *map;
     uint64_t size;
+    bool external_map;
 
     uint32_t version;
     uint64_t n_kv;
@@ -1058,7 +1059,7 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
-    if (m->map) munmap((void *)m->map, (size_t)m->size);
+    if (m->map && !m->external_map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
     m->fd = -1;
@@ -1169,10 +1170,41 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
+static void model_bind_mapping(
+        ds4_model   * m,
+        int           fd,
+        const void  * map,
+        uint64_t      size,
+        bool          external_map,
+        bool          metal_mapping) {
+    memset(m, 0, sizeof(*m));
+    m->fd = fd;
+    m->map = map;
+    m->size = size;
+    m->external_map = external_map;
+
+    if (!m->map) ds4_die("model mapping is null");
+    if (m->size < 32) ds4_die("model file is too small to be GGUF");
+
+    ds4_cursor c = cursor_at(m, 0);
+    uint32_t magic;
+    if (!cursor_u32(&c, &magic)) ds4_die(c.error);
+    if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
+    if (!cursor_u32(&c, &m->version)) ds4_die(c.error);
+    if (!cursor_u64(&c, &m->n_tensors)) ds4_die(c.error);
+    if (!cursor_u64(&c, &m->n_kv)) ds4_die(c.error);
+
+    if (m->version != 3) ds4_die("only GGUF v3 is supported");
+
+    parse_metadata(m, &c);
+    parse_tensors(m, &c);
+
+    if (!metal_mapping) model_prefetch_cpu_mapping(m);
+}
+
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress. */
 static void model_open(ds4_model *m, const char *path, bool metal_mapping) {
-    memset(m, 0, sizeof(*m));
     m->fd = -1;
 
     int fd = open(path, O_RDONLY);
@@ -1198,24 +1230,12 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping) {
     void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
     if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
 
-    m->fd = fd;
-    m->map = map;
-    m->size = (uint64_t)st.st_size;
+    model_bind_mapping(m, fd, map, (uint64_t)st.st_size, false, metal_mapping);
+}
 
-    ds4_cursor c = cursor_at(m, 0);
-    uint32_t magic;
-    if (!cursor_u32(&c, &magic)) ds4_die(c.error);
-    if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
-    if (!cursor_u32(&c, &m->version)) ds4_die(c.error);
-    if (!cursor_u64(&c, &m->n_tensors)) ds4_die(c.error);
-    if (!cursor_u64(&c, &m->n_kv)) ds4_die(c.error);
-
-    if (m->version != 3) ds4_die("only GGUF v3 is supported");
-
-    parse_metadata(m, &c);
-    parse_tensors(m, &c);
-
-    if (!metal_mapping) model_prefetch_cpu_mapping(m);
+static void model_open_external(ds4_model *m, const ds4_gguf_map *mapping, bool metal_mapping) {
+    if (!mapping) ds4_die("missing external GGUF mapping");
+    model_bind_mapping(m, -1, mapping->map, mapping->size, true, metal_mapping);
 }
 
 static void print_size(uint64_t bytes) {
@@ -1895,6 +1915,75 @@ typedef struct {
     ds4_layer_weights block;
 } ds4_mtp_weights;
 
+typedef struct {
+    bool present;
+    uint32_t ndim;
+    uint64_t dim[DS4_MAX_DIMS];
+    uint32_t tensor_type;
+    uint64_t abs_offset;
+    uint64_t bytes;
+} ds4_bound_tensor_ref;
+
+typedef struct {
+    ds4_bound_tensor_ref hc_attn_fn;
+    ds4_bound_tensor_ref hc_attn_scale;
+    ds4_bound_tensor_ref hc_attn_base;
+    ds4_bound_tensor_ref attn_norm;
+    ds4_bound_tensor_ref attn_q_a;
+    ds4_bound_tensor_ref attn_q_a_norm;
+    ds4_bound_tensor_ref attn_q_b;
+    ds4_bound_tensor_ref attn_kv;
+    ds4_bound_tensor_ref attn_kv_a_norm;
+    ds4_bound_tensor_ref attn_sinks;
+    ds4_bound_tensor_ref attn_output_a;
+    ds4_bound_tensor_ref attn_output_b;
+    ds4_bound_tensor_ref attn_compressor_ape;
+    ds4_bound_tensor_ref attn_compressor_kv;
+    ds4_bound_tensor_ref attn_compressor_gate;
+    ds4_bound_tensor_ref attn_compressor_norm;
+    ds4_bound_tensor_ref indexer_attn_q_b;
+    ds4_bound_tensor_ref indexer_proj;
+    ds4_bound_tensor_ref indexer_compressor_ape;
+    ds4_bound_tensor_ref indexer_compressor_kv;
+    ds4_bound_tensor_ref indexer_compressor_gate;
+    ds4_bound_tensor_ref indexer_compressor_norm;
+    ds4_bound_tensor_ref hc_ffn_fn;
+    ds4_bound_tensor_ref hc_ffn_scale;
+    ds4_bound_tensor_ref hc_ffn_base;
+    ds4_bound_tensor_ref ffn_norm;
+    ds4_bound_tensor_ref ffn_gate_tid2eid;
+    ds4_bound_tensor_ref ffn_gate_inp;
+    ds4_bound_tensor_ref ffn_exp_probs_b;
+    ds4_bound_tensor_ref ffn_gate_exps;
+    ds4_bound_tensor_ref ffn_up_exps;
+    ds4_bound_tensor_ref ffn_down_exps;
+    ds4_bound_tensor_ref ffn_gate_shexp;
+    ds4_bound_tensor_ref ffn_up_shexp;
+    ds4_bound_tensor_ref ffn_down_shexp;
+} ds4_layer_binding_ref;
+
+typedef struct {
+    ds4_bound_tensor_ref token_embd;
+    ds4_bound_tensor_ref output_hc_base;
+    ds4_bound_tensor_ref output_hc_fn;
+    ds4_bound_tensor_ref output_hc_scale;
+    ds4_bound_tensor_ref output_norm;
+    ds4_bound_tensor_ref output;
+    ds4_layer_binding_ref layer[DS4_N_LAYER];
+} ds4_weights_binding_ref;
+
+typedef struct {
+    ds4_bound_tensor_ref e_proj;
+    ds4_bound_tensor_ref h_proj;
+    ds4_bound_tensor_ref enorm;
+    ds4_bound_tensor_ref hnorm;
+    ds4_bound_tensor_ref norm;
+    ds4_bound_tensor_ref hc_head_base;
+    ds4_bound_tensor_ref hc_head_fn;
+    ds4_bound_tensor_ref hc_head_scale;
+    ds4_layer_binding_ref block;
+} ds4_mtp_weights_binding_ref;
+
 /* =========================================================================
  * Fixed Weight Binding and Model Validation.
  * =========================================================================
@@ -2523,6 +2612,160 @@ static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     l->ffn_gate_shexp  = required_tensor(m, "mtp.0.ffn_gate_shexp.weight");
     l->ffn_up_shexp    = required_tensor(m, "mtp.0.ffn_up_shexp.weight");
     l->ffn_down_shexp  = required_tensor(m, "mtp.0.ffn_down_shexp.weight");
+
+    mtp_weights_validate_layout(w);
+}
+
+static bool bound_tensor_matches(const ds4_tensor *t, const ds4_bound_tensor_ref *binding) {
+    if (!binding->present) return false;
+    if (t->type != binding->tensor_type ||
+        t->ndim != binding->ndim ||
+        t->abs_offset != binding->abs_offset ||
+        t->bytes != binding->bytes)
+    {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < binding->ndim; i++) {
+        if (t->dim[i] != binding->dim[i]) return false;
+    }
+    return true;
+}
+
+static ds4_tensor *required_prebound_tensor(
+        const ds4_model            * m,
+        const ds4_bound_tensor_ref * binding,
+        const char                 * label) {
+    if (!binding->present) {
+        fprintf(stderr, "ds4: required prebound tensor is missing: %s\n", label);
+        exit(1);
+    }
+
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        if (bound_tensor_matches(&m->tensors[i], binding)) return &m->tensors[i];
+    }
+
+    fprintf(stderr, "ds4: prebound tensor does not match loaded model: %s\n", label);
+    exit(1);
+}
+
+static ds4_tensor *optional_prebound_tensor(
+        const ds4_model            * m,
+        const ds4_bound_tensor_ref * binding,
+        const char                 * label) {
+    if (!binding->present) return NULL;
+    return required_prebound_tensor(m, binding, label);
+}
+
+static void weights_bind_prebound(
+        ds4_weights                  * w,
+        const ds4_model              * m,
+        const ds4_weights_binding_ref * binding) {
+    memset(w, 0, sizeof(*w));
+
+#define DS4_BIND_REQUIRED(dst, src, label) do { (dst) = required_prebound_tensor(m, &(src), label); } while (0)
+#define DS4_BIND_OPTIONAL(dst, src, label) do { (dst) = optional_prebound_tensor(m, &(src), label); } while (0)
+
+    DS4_BIND_REQUIRED(w->token_embd,      binding->token_embd,      "token_embd.weight");
+    DS4_BIND_REQUIRED(w->output_hc_base,  binding->output_hc_base,  "output_hc_base.weight");
+    DS4_BIND_REQUIRED(w->output_hc_fn,    binding->output_hc_fn,    "output_hc_fn.weight");
+    DS4_BIND_REQUIRED(w->output_hc_scale, binding->output_hc_scale, "output_hc_scale.weight");
+    DS4_BIND_REQUIRED(w->output_norm,     binding->output_norm,     "output_norm.weight");
+    DS4_BIND_REQUIRED(w->output,          binding->output,          "output.weight");
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_layer_weights *l = &w->layer[il];
+        const ds4_layer_binding_ref *b = &binding->layer[il];
+
+        DS4_BIND_REQUIRED(l->hc_attn_fn,      b->hc_attn_fn,      "hc_attn_fn.weight");
+        DS4_BIND_REQUIRED(l->hc_attn_scale,   b->hc_attn_scale,   "hc_attn_scale.weight");
+        DS4_BIND_REQUIRED(l->hc_attn_base,    b->hc_attn_base,    "hc_attn_base.weight");
+        DS4_BIND_REQUIRED(l->attn_norm,       b->attn_norm,       "attn_norm.weight");
+        DS4_BIND_REQUIRED(l->attn_q_a,        b->attn_q_a,        "attn_q_a.weight");
+        DS4_BIND_REQUIRED(l->attn_q_a_norm,   b->attn_q_a_norm,   "attn_q_a_norm.weight");
+        DS4_BIND_REQUIRED(l->attn_q_b,        b->attn_q_b,        "attn_q_b.weight");
+        DS4_BIND_REQUIRED(l->attn_kv,         b->attn_kv,         "attn_kv.weight");
+        DS4_BIND_REQUIRED(l->attn_kv_a_norm,  b->attn_kv_a_norm,  "attn_kv_a_norm.weight");
+        DS4_BIND_REQUIRED(l->attn_sinks,      b->attn_sinks,      "attn_sinks.weight");
+        DS4_BIND_REQUIRED(l->attn_output_a,   b->attn_output_a,   "attn_output_a.weight");
+        DS4_BIND_REQUIRED(l->attn_output_b,   b->attn_output_b,   "attn_output_b.weight");
+        DS4_BIND_OPTIONAL(l->attn_compressor_ape,  b->attn_compressor_ape,  "attn_compressor_ape.weight");
+        DS4_BIND_OPTIONAL(l->attn_compressor_kv,   b->attn_compressor_kv,   "attn_compressor_kv.weight");
+        DS4_BIND_OPTIONAL(l->attn_compressor_gate, b->attn_compressor_gate, "attn_compressor_gate.weight");
+        DS4_BIND_OPTIONAL(l->attn_compressor_norm, b->attn_compressor_norm, "attn_compressor_norm.weight");
+        DS4_BIND_OPTIONAL(l->indexer_attn_q_b,     b->indexer_attn_q_b,     "indexer.attn_q_b.weight");
+        DS4_BIND_OPTIONAL(l->indexer_proj,         b->indexer_proj,         "indexer.proj.weight");
+        DS4_BIND_OPTIONAL(l->indexer_compressor_ape,  b->indexer_compressor_ape,  "indexer_compressor_ape.weight");
+        DS4_BIND_OPTIONAL(l->indexer_compressor_kv,   b->indexer_compressor_kv,   "indexer_compressor_kv.weight");
+        DS4_BIND_OPTIONAL(l->indexer_compressor_gate, b->indexer_compressor_gate, "indexer_compressor_gate.weight");
+        DS4_BIND_OPTIONAL(l->indexer_compressor_norm, b->indexer_compressor_norm, "indexer_compressor_norm.weight");
+        DS4_BIND_REQUIRED(l->hc_ffn_fn,       b->hc_ffn_fn,       "hc_ffn_fn.weight");
+        DS4_BIND_REQUIRED(l->hc_ffn_scale,    b->hc_ffn_scale,    "hc_ffn_scale.weight");
+        DS4_BIND_REQUIRED(l->hc_ffn_base,     b->hc_ffn_base,     "hc_ffn_base.weight");
+        DS4_BIND_REQUIRED(l->ffn_norm,        b->ffn_norm,        "ffn_norm.weight");
+        DS4_BIND_OPTIONAL(l->ffn_gate_tid2eid, b->ffn_gate_tid2eid, "ffn_gate_tid2eid.weight");
+        DS4_BIND_REQUIRED(l->ffn_gate_inp,    b->ffn_gate_inp,    "ffn_gate_inp.weight");
+        DS4_BIND_OPTIONAL(l->ffn_exp_probs_b, b->ffn_exp_probs_b, "exp_probs_b.bias");
+        DS4_BIND_REQUIRED(l->ffn_gate_exps,   b->ffn_gate_exps,   "ffn_gate_exps.weight");
+        DS4_BIND_REQUIRED(l->ffn_up_exps,     b->ffn_up_exps,     "ffn_up_exps.weight");
+        DS4_BIND_REQUIRED(l->ffn_down_exps,   b->ffn_down_exps,   "ffn_down_exps.weight");
+        DS4_BIND_REQUIRED(l->ffn_gate_shexp,  b->ffn_gate_shexp,  "ffn_gate_shexp.weight");
+        DS4_BIND_REQUIRED(l->ffn_up_shexp,    b->ffn_up_shexp,    "ffn_up_shexp.weight");
+        DS4_BIND_REQUIRED(l->ffn_down_shexp,  b->ffn_down_shexp,  "ffn_down_shexp.weight");
+    }
+
+#undef DS4_BIND_REQUIRED
+#undef DS4_BIND_OPTIONAL
+
+    weights_validate_layout(w);
+}
+
+static void mtp_weights_bind_prebound(
+        ds4_mtp_weights                    * w,
+        const ds4_model                    * m,
+        const ds4_mtp_weights_binding_ref  * binding) {
+    memset(w, 0, sizeof(*w));
+
+#define DS4_BIND_REQUIRED(dst, src, label) do { (dst) = required_prebound_tensor(m, &(src), label); } while (0)
+
+    DS4_BIND_REQUIRED(w->hc_head_base,  binding->hc_head_base,  "mtp.0.hc_head_base.weight");
+    DS4_BIND_REQUIRED(w->hc_head_fn,    binding->hc_head_fn,    "mtp.0.hc_head_fn.weight");
+    DS4_BIND_REQUIRED(w->hc_head_scale, binding->hc_head_scale, "mtp.0.hc_head_scale.weight");
+    DS4_BIND_REQUIRED(w->e_proj,        binding->e_proj,        "mtp.0.e_proj.weight");
+    DS4_BIND_REQUIRED(w->h_proj,        binding->h_proj,        "mtp.0.h_proj.weight");
+    DS4_BIND_REQUIRED(w->enorm,         binding->enorm,         "mtp.0.enorm.weight");
+    DS4_BIND_REQUIRED(w->hnorm,         binding->hnorm,         "mtp.0.hnorm.weight");
+    DS4_BIND_REQUIRED(w->norm,          binding->norm,          "mtp.0.norm.weight");
+
+    ds4_layer_weights *l = &w->block;
+    const ds4_layer_binding_ref *b = &binding->block;
+
+    DS4_BIND_REQUIRED(l->hc_attn_fn,     b->hc_attn_fn,     "mtp.0.hc_attn_fn.weight");
+    DS4_BIND_REQUIRED(l->hc_attn_scale,  b->hc_attn_scale,  "mtp.0.hc_attn_scale.weight");
+    DS4_BIND_REQUIRED(l->hc_attn_base,   b->hc_attn_base,   "mtp.0.hc_attn_base.weight");
+    DS4_BIND_REQUIRED(l->attn_norm,      b->attn_norm,      "mtp.0.attn_norm.weight");
+    DS4_BIND_REQUIRED(l->attn_q_a,       b->attn_q_a,       "mtp.0.attn_q_a.weight");
+    DS4_BIND_REQUIRED(l->attn_q_a_norm,  b->attn_q_a_norm,  "mtp.0.attn_q_a_norm.weight");
+    DS4_BIND_REQUIRED(l->attn_q_b,       b->attn_q_b,       "mtp.0.attn_q_b.weight");
+    DS4_BIND_REQUIRED(l->attn_kv,        b->attn_kv,        "mtp.0.attn_kv.weight");
+    DS4_BIND_REQUIRED(l->attn_kv_a_norm, b->attn_kv_a_norm, "mtp.0.attn_kv_a_norm.weight");
+    DS4_BIND_REQUIRED(l->attn_sinks,     b->attn_sinks,     "mtp.0.attn_sinks.weight");
+    DS4_BIND_REQUIRED(l->attn_output_a,  b->attn_output_a,  "mtp.0.attn_output_a.weight");
+    DS4_BIND_REQUIRED(l->attn_output_b,  b->attn_output_b,  "mtp.0.attn_output_b.weight");
+    DS4_BIND_REQUIRED(l->hc_ffn_fn,      b->hc_ffn_fn,      "mtp.0.hc_ffn_fn.weight");
+    DS4_BIND_REQUIRED(l->hc_ffn_scale,   b->hc_ffn_scale,   "mtp.0.hc_ffn_scale.weight");
+    DS4_BIND_REQUIRED(l->hc_ffn_base,    b->hc_ffn_base,    "mtp.0.hc_ffn_base.weight");
+    DS4_BIND_REQUIRED(l->ffn_norm,       b->ffn_norm,       "mtp.0.ffn_norm.weight");
+    DS4_BIND_REQUIRED(l->ffn_gate_inp,   b->ffn_gate_inp,   "mtp.0.ffn_gate_inp.weight");
+    DS4_BIND_REQUIRED(l->ffn_exp_probs_b, b->ffn_exp_probs_b, "mtp.0.exp_probs_b.bias");
+    DS4_BIND_REQUIRED(l->ffn_gate_exps,  b->ffn_gate_exps,  "mtp.0.ffn_gate_exps.weight");
+    DS4_BIND_REQUIRED(l->ffn_up_exps,    b->ffn_up_exps,    "mtp.0.ffn_up_exps.weight");
+    DS4_BIND_REQUIRED(l->ffn_down_exps,  b->ffn_down_exps,  "mtp.0.ffn_down_exps.weight");
+    DS4_BIND_REQUIRED(l->ffn_gate_shexp, b->ffn_gate_shexp, "mtp.0.ffn_gate_shexp.weight");
+    DS4_BIND_REQUIRED(l->ffn_up_shexp,   b->ffn_up_shexp,   "mtp.0.ffn_up_shexp.weight");
+    DS4_BIND_REQUIRED(l->ffn_down_shexp, b->ffn_down_shexp, "mtp.0.ffn_down_shexp.weight");
+
+#undef DS4_BIND_REQUIRED
 
     mtp_weights_validate_layout(w);
 }
@@ -15676,7 +15919,13 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
-int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+static int ds4_engine_open_common(
+    ds4_engine             ** out,
+    const ds4_engine_options * opt,
+    const ds4_gguf_map     * model_map,
+    const ds4_weights_binding_ref * model_bindings,
+    const ds4_gguf_map     * mtp_map,
+    const ds4_mtp_weights_binding_ref * mtp_bindings) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
@@ -15688,14 +15937,30 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
-    model_open(&e->model, opt->model_path, opt->backend == DS4_BACKEND_METAL);
+    if (model_map) {
+        model_open_external(&e->model, model_map, opt->backend == DS4_BACKEND_METAL);
+    } else {
+        model_open(&e->model, opt->model_path, opt->backend == DS4_BACKEND_METAL);
+    }
     if (opt->warm_weights) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
-    weights_bind(&e->weights, &e->model);
+    if (model_bindings) {
+        weights_bind_prebound(&e->weights, &e->model, model_bindings);
+    } else {
+        weights_bind(&e->weights, &e->model);
+    }
     if (opt->mtp_path && opt->mtp_path[0]) {
-        model_open(&e->mtp_model, opt->mtp_path, opt->backend == DS4_BACKEND_METAL);
-        mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
+        if (mtp_map) {
+            model_open_external(&e->mtp_model, mtp_map, opt->backend == DS4_BACKEND_METAL);
+        } else {
+            model_open(&e->mtp_model, opt->mtp_path, opt->backend == DS4_BACKEND_METAL);
+        }
+        if (mtp_bindings) {
+            mtp_weights_bind_prebound(&e->mtp_weights, &e->mtp_model, mtp_bindings);
+        } else {
+            mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
+        }
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
                 opt->mtp_path,
@@ -15750,6 +16015,30 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
     *out = e;
     return 0;
+}
+
+int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
+    return ds4_engine_open_common(out, opt, NULL, NULL, NULL, NULL);
+}
+
+int ds4_engine_open_mapped(
+        ds4_engine             ** out,
+        const ds4_engine_options * opt,
+        const ds4_gguf_map     * model_map,
+        const ds4_gguf_map     * mtp_map) {
+    if (!model_map) return 1;
+    return ds4_engine_open_common(out, opt, model_map, NULL, mtp_map, NULL);
+}
+
+int ds4_engine_open_prebound_mapped(
+        ds4_engine                      ** out,
+        const ds4_engine_options        * opt,
+        const ds4_gguf_map              * model_map,
+        const ds4_weights_binding_ref   * model_bindings,
+        const ds4_gguf_map              * mtp_map,
+        const ds4_mtp_weights_binding_ref * mtp_bindings) {
+    if (!model_map || !model_bindings) return 1;
+    return ds4_engine_open_common(out, opt, model_map, model_bindings, mtp_map, mtp_bindings);
 }
 
 void ds4_engine_summary(ds4_engine *e) {

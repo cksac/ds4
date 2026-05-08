@@ -1,0 +1,36 @@
+[package]
+name = "ds4-rust"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "ds4_rust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ds4-rs"
+path = "src/bin/ds4.rs"
+
+[[bin]]
+name = "ds4-server-rs"
+path = "src/bin/ds4-server.rs"
+
+[[bin]]
+name = "download-model-rs"
+path = "src/bin/download-model.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.7", features = ["http1", "json", "tokio"] }
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+futures-util = "0.3"
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[build-dependencies]
+cc = "1"

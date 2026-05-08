@@ -65,6 +65,11 @@ typedef struct {
     bool quality;
 } ds4_engine_options;
 
+typedef struct {
+    const void *map;
+    uint64_t size;
+} ds4_gguf_map;
+
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
 typedef void (*ds4_generation_done_fn)(void *ud);
 
@@ -79,6 +84,9 @@ typedef struct {
 } ds4_context_memory;
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
+int ds4_engine_open_mapped(ds4_engine **out, const ds4_engine_options *opt,
+                           const ds4_gguf_map *model_map,
+                           const ds4_gguf_map *mtp_map);
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);

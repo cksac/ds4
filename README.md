@@ -56,6 +56,9 @@ experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
 majority of all the model space: the other components (shared experts,
 projections, routing) are left untouched to guarantee quality.
 
+`./download_model.sh` is now a compatibility shim over the Rust downloader
+binary `download-model-rs`.
+
 Download one main model:
 
 ```sh
@@ -63,8 +66,9 @@ Download one main model:
 ./download_model.sh q4   # >= 256 GB RAM machines
 ```
 
-The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
-stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
+The Rust downloader uses `hf_hub` against
+`https://huggingface.co/antirez/deepseek-v4-gguf`, reuses the Hugging Face
+cache for resumable downloads, exposes the selected file under `./gguf/`, and
 updates `./ds4flash.gguf` to point at the selected q2/q4 model. Authentication
 is optional for public downloads, but `--token TOKEN`, `HF_TOKEN`, or the local
 Hugging Face token cache are used when present.
@@ -80,6 +84,54 @@ Then build:
 ```sh
 make
 ```
+
+## Rust Host Port
+
+The repository now also contains an experimental Cargo workspace that keeps the
+existing native engine and Metal path intact while moving the app layer to
+Rust. The Rust binaries link against the current `ds4.c` engine boundary and
+reuse `ds4_metal.m` plus the `metal/*.metal` kernels unchanged.
+
+Build the Rust binaries with:
+
+```sh
+cargo build --bins
+```
+
+Or with the Makefile helper:
+
+```sh
+make rust
+```
+
+The Rust entrypoints are:
+
+```sh
+cargo run --bin download-model-rs -- q2
+cargo run --bin ds4-rs -- -p "Explain Redis streams in one paragraph."
+cargo run --bin ds4-server-rs -- --ctx 100000
+```
+
+Current Rust scope:
+
+- Reuses the existing `ds4.h` engine/session API and the Metal executor.
+- Ports model downloading to Rust via `download-model-rs`, using `hf_hub` for
+  cached and resumable Hugging Face downloads.
+- Ports pure engine-side helpers to Rust, including DS4 rendered-chat prompt
+  construction, rendered-chat special-token scanning/token assembly,
+  GGUF-backed tokenizer metadata loading, token byte decoding, JoyAI BPE text
+  tokenization, GGUF model summary/inspect parsing, DeepSeek4 metadata
+  validation during engine open, GGUF tensor-directory parsing/range
+  validation, Rust-owned GGUF mmap creation, think-mode gating, and
+  context-memory estimation.
+- Ports the CLI flow to Rust, including one-shot prompts and interactive chat.
+- Ports a basic HTTP server to Rust for `/v1/models`, `/v1/chat/completions`,
+  `/v1/completions`, and `/v1/messages`.
+- Keeps the advanced C server-only features in place for now: DSML tool-schema
+  rendering/parsing, Anthropic/OpenAI streaming parity, and disk KV cache
+  policy remain in `ds4_server.c`.
+- Keeps DS4 weight pointer binding, session sync/eval, and Metal graph
+  execution in `ds4.c` for now.
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and

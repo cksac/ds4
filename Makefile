@@ -18,7 +18,7 @@ NATIVE_CORE_OBJS = ds4_native.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all clean test
+.PHONY: all clean test rust rust-release
 
 all: ds4 ds4-server
 
@@ -71,6 +71,12 @@ ds4_test: ds4_test.o $(CORE_OBJS)
 
 test: ds4_test
 	./ds4_test
+
+rust:
+	cargo build --bins
+
+rust-release:
+	cargo build --release --bins
 
 clean:
 	rm -f ds4 ds4-server ds4_native ds4_server_test ds4_test *.o
