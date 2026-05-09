@@ -577,6 +577,8 @@ typedef struct {
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
+    int cache_read_tokens;
+    int cache_write_tokens;
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
@@ -3147,6 +3149,29 @@ static bool sse_chunk(int fd, const request *r, const char *id, const char *text
     return ok;
 }
 
+static int clamp_usage_tokens(int value, int max) {
+    if (value < 0) return 0;
+    if (max >= 0 && value > max) return max;
+    return value;
+}
+
+static void append_openai_usage_json(buf *b, const request *r,
+                                     int prompt_tokens, int completion_tokens) {
+    int cached_tokens = r ? r->cache_read_tokens : 0;
+    int cache_write_tokens = r ? r->cache_write_tokens : 0;
+    cached_tokens = clamp_usage_tokens(cached_tokens, prompt_tokens);
+    cache_write_tokens = clamp_usage_tokens(cache_write_tokens, prompt_tokens - cached_tokens);
+    /* Some OpenAI-compatible consumers normalize cache-write tokens by removing
+     * them from cached_tokens when both fields are present.  Include newly
+     * written tokens here so consumers can recover read and write counts. */
+    int reported_cached_tokens = clamp_usage_tokens(cached_tokens + cache_write_tokens, prompt_tokens);
+    buf_printf(b,
+               "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d,"
+               "\"prompt_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d}}",
+               prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
+               reported_cached_tokens, cache_write_tokens);
+}
+
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
                             int prompt_tokens, int completion_tokens) {
     if (!r->stream_include_usage) return true;
@@ -3162,9 +3187,8 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
         json_escape(&b, r->model);
         buf_puts(&b, ",\"choices\":[],\"usage\":");
     }
-    buf_printf(&b,
-               "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n\n",
-               prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+    append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    buf_puts(&b, "}\n\n");
 
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
@@ -4188,8 +4212,8 @@ static bool final_response(int fd, const request *r, const char *id, const char 
         json_escape(&b, finish);
         buf_puts(&b, "}],\"usage\":");
     }
-    buf_printf(&b, "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n",
-               prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+    append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
+    buf_puts(&b, "}\n");
     bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -6960,6 +6984,12 @@ static void generate_job(server *s, job *j) {
         }
     }
     const int prompt_tokens = prompt_for_sync->len;
+    /* OpenAI usage details: the reusable prefix is a cache read, while the
+     * effective prompt suffix evaluated by ds4_session_sync() is written into
+     * the live KV cache and can be reused by the next request. */
+    j->req.cache_read_tokens = cached;
+    j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
+
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
@@ -8390,6 +8420,37 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
 
     free(out);
     tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_stream_usage_reports_cache_details(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.stream_include_usage = true;
+    r.cache_read_tokens = 7;
+    r.cache_write_tokens = 3;
+
+    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_usage", 10, 2));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"usage\":{\"prompt_tokens\":10") != NULL);
+    TEST_ASSERT(strstr(out, "\"completion_tokens\":2") != NULL);
+    TEST_ASSERT(strstr(out, "\"total_tokens\":12") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_tokens_details\":{") != NULL);
+    TEST_ASSERT(strstr(out, "\"cached_tokens\":10") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_write_tokens\":3") != NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+
+    free(out);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -10253,6 +10314,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_openai_tool_stream_sends_incremental_text();
+    test_openai_stream_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
