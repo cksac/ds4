@@ -3,6 +3,10 @@ mod ffi;
 mod metal_runtime;
 #[cfg(target_os = "macos")]
 mod metal_native;
+#[cfg(target_os = "macos")]
+mod metal_bridge;
+#[cfg(target_os = "macos")]
+mod metal_kernels;
 
 use gguf::{
     validate_model_config_bytes, BoundTensor, Ds4LayerTensorBindings, Ds4MtpTensorBindings,
@@ -2394,7 +2398,7 @@ impl Engine {
         // 1. Embed the input token into the initial HC state.
         let n_vocab = weights.token_embd.descriptor.dims[1] as u32;
         let ok = unsafe {
-            ffi::ds4_metal_embed_token_hc_tensor(
+            crate::metal_kernels::embed_token_hc_tensor(
                 metal.cur_hc.as_ptr(),
                 model_map,
                 model_size,
@@ -2481,13 +2485,13 @@ impl Engine {
         ok!(metal_runtime::rms_norm_plain_tensor(
             &metal.flat_hc, &metal.cur_hc, hc_dim, DS4_RMS_EPS), "rms_norm_plain");
 
-        ok!(unsafe { ffi::ds4_metal_matmul_f16_tensor(
+        ok!(unsafe { crate::metal_kernels::matmul_f16_tensor(
             metal.hc_mix.as_ptr(), model_map, model_size,
             binding.hc_attn_fn.descriptor.abs_offset,
             hc_dim as u64, mix_hc as u64,
             metal.flat_hc.as_const_ptr(), 1) }, "hc_attn_fn matmul");
 
-        ok!(unsafe { ffi::ds4_metal_hc_split_weighted_sum_norm_tensor(
+        ok!(unsafe { crate::metal_kernels::hc_split_weighted_sum_norm_tensor(
             metal.attn_cur.as_ptr(), metal.attn_norm.as_ptr(), metal.hc_split.as_ptr(),
             metal.hc_mix.as_const_ptr(), metal.cur_hc.as_const_ptr(),
             model_map, model_size,
@@ -2498,19 +2502,19 @@ impl Engine {
             DS4_HC_EPS, DS4_RMS_EPS) }, "hc_split_weighted_sum_norm");
 
         // ---- Q low-rank projection and KV projection (fused norm pass) -----
-        ok!(unsafe { ffi::ds4_metal_matmul_q8_0_tensor(
+        ok!(unsafe { crate::metal_kernels::matmul_q8_0_tensor(
             metal.qr.as_ptr(), model_map, model_size,
             binding.attn_q_a.descriptor.abs_offset,
             DS4_N_EMBD as u64, q_rank as u64,
             metal.attn_norm.as_const_ptr(), 1) }, "attn_q_a matmul");
 
-        ok!(unsafe { ffi::ds4_metal_matmul_q8_0_tensor(
+        ok!(unsafe { crate::metal_kernels::matmul_q8_0_tensor(
             metal.kv_raw.as_ptr(), model_map, model_size,
             binding.attn_kv.descriptor.abs_offset,
             DS4_N_EMBD as u64, DS4_N_HEAD_DIM,
             metal.attn_norm.as_const_ptr(), 1) }, "attn_kv matmul");
 
-        ok!(unsafe { ffi::ds4_metal_dsv4_qkv_rms_norm_rows_tensor(
+        ok!(unsafe { crate::metal_kernels::dsv4_qkv_rms_norm_rows_tensor(
             metal.qr_norm.as_ptr(), metal.qr.as_const_ptr(),
             model_map, model_size,
             binding.attn_q_a_norm.descriptor.abs_offset, q_rank,
@@ -2519,31 +2523,31 @@ impl Engine {
             1, DS4_RMS_EPS) }, "qkv_rms_norm");
 
         // ---- Full Q projection and per-head RMSNorm -------------------------
-        ok!(unsafe { ffi::ds4_metal_matmul_q8_0_tensor(
+        ok!(unsafe { crate::metal_kernels::matmul_q8_0_tensor(
             metal.q.as_ptr(), model_map, model_size,
             binding.attn_q_b.descriptor.abs_offset,
             q_rank as u64, q_dim as u64,
             metal.qr_norm.as_const_ptr(), 1) }, "attn_q_b matmul");
 
-        ok!(unsafe { ffi::ds4_metal_head_rms_norm_tensor(
+        ok!(unsafe { crate::metal_kernels::head_rms_norm_tensor(
             metal.q.as_ptr(), 1, DS4_N_HEAD, DS4_N_HEAD_DIM as u32, DS4_RMS_EPS) },
             "head_rms_norm Q");
 
         // ---- Q RoPE ---------------------------------------------------------
-        ok!(unsafe { ffi::ds4_metal_rope_tail_tensor(
+        ok!(unsafe { crate::metal_kernels::rope_tail_tensor(
             metal.q.as_ptr(), 1, DS4_N_HEAD, DS4_N_HEAD_DIM as u32,
             DS4_N_ROT as u32, pos, n_ctx_orig, false,
             freq_base, freq_scale, ext_factor, attn_factor,
             DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) }, "rope Q");
 
         // ---- KV RoPE + FP8 quantize + store raw cache ----------------------
-        ok!(unsafe { ffi::ds4_metal_rope_tail_tensor(
+        ok!(unsafe { crate::metal_kernels::rope_tail_tensor(
             metal.kv.as_ptr(), 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM as u32,
             DS4_N_ROT as u32, pos, n_ctx_orig, false,
             freq_base, freq_scale, ext_factor, attn_factor,
             DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) }, "rope KV");
 
-        ok!(unsafe { ffi::ds4_metal_kv_fp8_store_raw_tensor(
+        ok!(unsafe { crate::metal_kernels::kv_fp8_store_raw_tensor(
             metal.kv.as_ptr(), layer_cache.raw_kv.as_ptr(),
             metal.raw_cap, raw_row, DS4_N_HEAD_DIM as u32, DS4_N_ROT as u32) },
             "kv_fp8_store_raw");
@@ -2563,7 +2567,7 @@ impl Engine {
             let norm_b = binding.attn_compressor_norm.as_ref()
                 .ok_or_else(|| anyhow!("missing attn_compressor_norm at layer {}", il))?;
 
-            ok!(unsafe { ffi::ds4_metal_matmul_f16_pair_tensor(
+            ok!(unsafe { crate::metal_kernels::matmul_f16_pair_tensor(
                 metal.comp_kv_cur.as_ptr(), metal.comp_sc_cur.as_ptr(),
                 model_map, model_size,
                 kv_b.descriptor.abs_offset, gate_b.descriptor.abs_offset,
@@ -2578,7 +2582,7 @@ impl Engine {
                 .ok_or_else(|| anyhow!("missing attn_comp_kv at layer {}", il))?;
 
             let comp_row = layer_cache.n_comp;
-            ok!(unsafe { ffi::ds4_metal_compressor_update_tensor(
+            ok!(unsafe { crate::metal_kernels::compressor_update_tensor(
                 metal.comp_kv_cur.as_const_ptr(), metal.comp_sc_cur.as_const_ptr(),
                 attn_state_kv.as_ptr(), attn_state_score.as_ptr(),
                 attn_comp_kv.as_ptr(),
@@ -2597,7 +2601,7 @@ impl Engine {
                 let row_bytes  = DS4_N_HEAD_DIM * 4;
                 let row_view = MetalTensor::view(attn_comp_kv, row_offset, row_bytes)
                     .ok_or_else(|| anyhow!("failed to create comp row view at layer {}", il))?;
-                ok!(unsafe { ffi::ds4_metal_dsv4_fp8_kv_quantize_tensor(
+                ok!(unsafe { crate::metal_kernels::dsv4_fp8_kv_quantize_tensor(
                     row_view.as_ptr(), 1, DS4_N_HEAD_DIM as u32, DS4_N_ROT as u32) },
                     "fp8_kv_quantize comp row");
                 layer_cache.n_comp += 1;
@@ -2619,7 +2623,7 @@ impl Engine {
 
                 let index_width = coff as u64 * DS4_N_INDEXER_HEAD_DIM;
 
-                ok!(unsafe { ffi::ds4_metal_matmul_f16_pair_tensor(
+                ok!(unsafe { crate::metal_kernels::matmul_f16_pair_tensor(
                     metal.comp_kv_cur.as_ptr(), metal.comp_sc_cur.as_ptr(),
                     model_map, model_size,
                     kv_ib.descriptor.abs_offset, gate_ib.descriptor.abs_offset,
@@ -2634,7 +2638,7 @@ impl Engine {
                     .ok_or_else(|| anyhow!("missing index_comp_kv at layer {}", il))?;
 
                 let index_row = layer_cache.n_index_comp;
-                ok!(unsafe { ffi::ds4_metal_compressor_update_tensor(
+                ok!(unsafe { crate::metal_kernels::compressor_update_tensor(
                     metal.comp_kv_cur.as_const_ptr(), metal.comp_sc_cur.as_const_ptr(),
                     index_state_kv.as_ptr(), index_state_score.as_ptr(),
                     index_comp_kv.as_ptr(),
@@ -2659,20 +2663,20 @@ impl Engine {
                         .ok_or_else(|| anyhow!("missing indexer_proj at layer {}", il))?;
                     let indexer_q_dim = DS4_N_INDEXER_HEAD as u64 * DS4_N_INDEXER_HEAD_DIM;
 
-                    ok!(unsafe { ffi::ds4_metal_matmul_f16_tensor(
+                    ok!(unsafe { crate::metal_kernels::matmul_f16_tensor(
                         metal.indexer_q.as_ptr(), model_map, model_size,
                         indexer_q_b.descriptor.abs_offset,
                         q_rank as u64, indexer_q_dim,
                         metal.qr_norm.as_const_ptr(), 1) }, "indexer Q proj");
 
-                    ok!(unsafe { ffi::ds4_metal_rope_tail_tensor(
+                    ok!(unsafe { crate::metal_kernels::rope_tail_tensor(
                         metal.indexer_q.as_ptr(), 1,
                         DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM as u32,
                         DS4_N_ROT as u32, pos, n_ctx_orig, false,
                         freq_base, freq_scale, ext_factor, attn_factor,
                         DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) }, "rope indexer Q");
 
-                    ok!(unsafe { ffi::ds4_metal_matmul_f16_tensor(
+                    ok!(unsafe { crate::metal_kernels::matmul_f16_tensor(
                         metal.indexer_weights.as_ptr(), model_map, model_size,
                         indexer_proj_b.descriptor.abs_offset,
                         DS4_N_EMBD as u64, DS4_N_INDEXER_HEAD as u64,
@@ -2681,7 +2685,7 @@ impl Engine {
                     let index_scale = 1.0f32
                         / ((DS4_N_INDEXER_HEAD_DIM as f32 * DS4_N_INDEXER_HEAD as f32).sqrt());
 
-                    ok!(unsafe { ffi::ds4_metal_indexer_score_one_tensor(
+                    ok!(unsafe { crate::metal_kernels::indexer_score_one_tensor(
                         metal.indexer_scores.as_ptr(),
                         metal.indexer_q.as_const_ptr(),
                         metal.indexer_weights.as_const_ptr(),
@@ -2690,7 +2694,7 @@ impl Engine {
                         DS4_N_INDEXER_HEAD_DIM as u32, index_scale) }, "indexer_score");
 
                     let effective_top_k = decode_top_k.min(n_index_comp);
-                    ok!(unsafe { ffi::ds4_metal_indexer_topk_tensor(
+                    ok!(unsafe { crate::metal_kernels::indexer_topk_tensor(
                         metal.comp_selected.as_ptr(),
                         metal.indexer_scores.as_const_ptr(),
                         n_index_comp, 1, effective_top_k) }, "indexer_topk");
@@ -2712,7 +2716,7 @@ impl Engine {
             // Ratio-4 indexed mixed attention.
             let attn_comp_kv = layer_cache.attn_comp_kv.as_ref().unwrap();
             let n_selected = (DS4_N_INDEXER_TOP_K as u32).min(layer_cache.n_index_comp);
-            ok!(unsafe { ffi::ds4_metal_attention_indexed_mixed_batch_heads_tensor(
+            ok!(unsafe { crate::metal_kernels::attention_indexed_mixed_batch_heads_tensor(
                 metal.heads.as_ptr(), model_map, model_size, attn_sinks_offset,
                 metal.q.as_const_ptr(), layer_cache.raw_kv.as_const_ptr(),
                 attn_comp_kv.as_const_ptr(), comp_selected_ptr,
@@ -2727,7 +2731,7 @@ impl Engine {
             } else {
                 std::ptr::null()
             };
-            ok!(unsafe { ffi::ds4_metal_attention_decode_heads_tensor(
+            ok!(unsafe { crate::metal_kernels::attention_decode_heads_tensor(
                 metal.heads.as_ptr(), model_map, model_size, attn_sinks_offset,
                 metal.q.as_const_ptr(), layer_cache.raw_kv.as_const_ptr(),
                 n_raw, metal.raw_cap, raw_start,
@@ -2738,7 +2742,7 @@ impl Engine {
         }
 
         // ---- Inverse RoPE on attention output --------------------------------
-        ok!(unsafe { ffi::ds4_metal_rope_tail_tensor(
+        ok!(unsafe { crate::metal_kernels::rope_tail_tensor(
             metal.heads.as_ptr(), 1, DS4_N_HEAD, DS4_N_HEAD_DIM as u32,
             DS4_N_ROT as u32, pos, n_ctx_orig, true,
             freq_base, freq_scale, ext_factor, attn_factor,
@@ -2747,13 +2751,13 @@ impl Engine {
         // ---- Attention output projection + HC expand (fused) -----------------
         let group_dim = DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP) as u64;
         let rank      = DS4_N_LORA_O as u64;
-        ok!(unsafe { ffi::ds4_metal_attention_output_low_q8_tensor(
+        ok!(unsafe { crate::metal_kernels::attention_output_low_q8_tensor(
             metal.attn_low.as_ptr(), model_map, model_size,
             binding.attn_output_a.descriptor.abs_offset,
             group_dim, rank, DS4_N_OUT_GROUP,
             metal.heads.as_const_ptr()) }, "attn_output_low");
 
-        ok!(unsafe { ffi::ds4_metal_matmul_q8_0_hc_expand_tensor(
+        ok!(unsafe { crate::metal_kernels::matmul_q8_0_hc_expand_tensor(
             metal.after_attn_hc.as_ptr(), metal.attn_out.as_ptr(),
             model_map, model_size,
             binding.attn_output_b.descriptor.abs_offset,
@@ -2773,13 +2777,13 @@ impl Engine {
             &metal.flat_hc, &metal.after_attn_hc, hc_dim, DS4_RMS_EPS),
             "rms_norm_plain FFN");
 
-        ok!(unsafe { ffi::ds4_metal_matmul_f16_tensor(
+        ok!(unsafe { crate::metal_kernels::matmul_f16_tensor(
             metal.hc_mix.as_ptr(), model_map, model_size,
             binding.hc_ffn_fn.descriptor.abs_offset,
             hc_dim as u64, mix_hc as u64,
             metal.flat_hc.as_const_ptr(), 1) }, "hc_ffn_fn matmul");
 
-        ok!(unsafe { ffi::ds4_metal_hc_split_weighted_sum_norm_tensor(
+        ok!(unsafe { crate::metal_kernels::hc_split_weighted_sum_norm_tensor(
             metal.ffn_cur.as_ptr(), metal.ffn_norm.as_ptr(), metal.hc_split.as_ptr(),
             metal.hc_mix.as_const_ptr(), metal.after_attn_hc.as_const_ptr(),
             model_map, model_size,
@@ -2790,7 +2794,7 @@ impl Engine {
             DS4_HC_EPS, DS4_RMS_EPS) }, "hc_split_weighted_sum_norm FFN");
 
         // ---- Router + routed MoE --------------------------------------------
-        ok!(unsafe { ffi::ds4_metal_matmul_f16_tensor(
+        ok!(unsafe { crate::metal_kernels::matmul_f16_tensor(
             metal.router_logits.as_ptr(), model_map, model_size,
             binding.ffn_gate_inp.descriptor.abs_offset,
             DS4_N_EMBD as u64, DS4_N_EXPERT as u64,
@@ -2805,7 +2809,7 @@ impl Engine {
         let has_bias    = binding.ffn_exp_probs_b.is_some();
         let hash_mode   = binding.ffn_gate_tid2eid.is_some();
 
-        ok!(unsafe { ffi::ds4_metal_router_select_tensor(
+        ok!(unsafe { crate::metal_kernels::router_select_tensor(
             metal.router_selected.as_ptr(), metal.router_weights.as_ptr(),
             metal.router_probs.as_ptr(),
             model_map, model_size,
@@ -2823,7 +2827,7 @@ impl Engine {
         let gate_expert_bytes = expert_mid_dim as u64 * gate_row_bytes;
         let down_expert_bytes = routed_out_dim as u64 * down_row_bytes;
 
-        ok!(unsafe { ffi::ds4_metal_routed_moe_one_tensor(
+        ok!(unsafe { crate::metal_kernels::routed_moe_one_tensor(
             metal.routed_out.as_ptr(),
             metal.routed_gate.as_ptr(), metal.routed_up.as_ptr(),
             metal.routed_mid.as_ptr(),
@@ -2843,7 +2847,7 @@ impl Engine {
             metal.ffn_norm.as_const_ptr()) }, "routed_moe_one");
 
         // ---- Shared expert + fused HC expand --------------------------------
-        ok!(unsafe { ffi::ds4_metal_shared_gate_up_swiglu_q8_0_tensor(
+        ok!(unsafe { crate::metal_kernels::shared_gate_up_swiglu_q8_0_tensor(
             metal.shared_gate.as_ptr(), metal.shared_up.as_ptr(), metal.shared_mid.as_ptr(),
             model_map, model_size,
             binding.ffn_gate_shexp.descriptor.abs_offset,
@@ -2852,7 +2856,7 @@ impl Engine {
             metal.ffn_norm.as_const_ptr()) }, "shared_gate_up_swiglu");
 
         // Fused shared down projection + routed add + HC expand.
-        ok!(unsafe { ffi::ds4_metal_shared_down_hc_expand_q8_0_tensor(
+        ok!(unsafe { crate::metal_kernels::shared_down_hc_expand_q8_0_tensor(
             metal.after_ffn_hc.as_ptr(), metal.shared_out.as_ptr(),
             model_map, model_size,
             binding.ffn_down_shexp.descriptor.abs_offset,
@@ -2888,31 +2892,31 @@ impl Engine {
             &metal.flat_hc, &metal.cur_hc, hc_dim, DS4_RMS_EPS),
             "rms_norm_plain HC");
 
-        ok!(unsafe { ffi::ds4_metal_matmul_f16_tensor(
+        ok!(unsafe { crate::metal_kernels::matmul_f16_tensor(
             metal.output_pre.as_ptr(), model_map, model_size,
             weights.output_hc_fn.descriptor.abs_offset,
             hc_dim as u64, DS4_N_HC as u64,
             metal.flat_hc.as_const_ptr(), 1) }, "output_hc_fn matmul");
 
-        ok!(unsafe { ffi::ds4_metal_output_hc_weights_tensor(
+        ok!(unsafe { crate::metal_kernels::output_hc_weights_tensor(
             metal.output_weights.as_ptr(), metal.output_pre.as_const_ptr(),
             model_map, model_size,
             weights.output_hc_scale.descriptor.abs_offset,
             weights.output_hc_base.descriptor.abs_offset,
             DS4_N_HC as u32, DS4_HC_EPS) }, "output_hc_weights");
 
-        ok!(unsafe { ffi::ds4_metal_hc_weighted_sum_tensor(
+        ok!(unsafe { crate::metal_kernels::hc_weighted_sum_tensor(
             metal.output_embd.as_ptr(), metal.cur_hc.as_const_ptr(),
             metal.output_weights.as_const_ptr(),
             DS4_N_EMBD as u32, DS4_N_HC as u32) }, "hc_weighted_sum");
 
-        ok!(unsafe { ffi::ds4_metal_rms_norm_weight_tensor(
+        ok!(unsafe { crate::metal_kernels::rms_norm_weight_tensor(
             metal.output_norm.as_ptr(), metal.output_embd.as_const_ptr(),
             model_map, model_size,
             weights.output_norm.descriptor.abs_offset,
             DS4_N_EMBD as u32, DS4_RMS_EPS) }, "output_norm");
 
-        ok!(unsafe { ffi::ds4_metal_matmul_q8_0_tensor(
+        ok!(unsafe { crate::metal_kernels::matmul_q8_0_tensor(
             metal.logits.as_ptr(), model_map, model_size,
             weights.output.descriptor.abs_offset,
             DS4_N_EMBD as u64, metal.vocab_dim,

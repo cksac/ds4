@@ -1,6 +1,7 @@
-use crate::ffi;
 use anyhow::{bail, Result};
 use libc::c_void;
+
+use crate::ffi;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ModelMapRange {
@@ -10,11 +11,8 @@ pub(crate) struct ModelMapRange {
     pub map_size: u64,
 }
 
-pub(crate) fn tensor_alloc(bytes: u64) -> *mut ffi::ds4_metal_tensor {
-    unsafe { ffi::ds4_metal_tensor_alloc(bytes) }
-}
-
 pub(crate) fn initialize(quality: bool, model_ranges: &[ModelMapRange]) -> Result<()> {
+    // Use FFI backend for now - will gradually port to metal_bridge when ready
     let ok = unsafe { ffi::ds4_metal_init() };
     if ok == 0 {
         bail!("Metal backend unavailable; failed to initialize runtime")
@@ -40,11 +38,40 @@ pub(crate) fn initialize(quality: bool, model_ranges: &[ModelMapRange]) -> Resul
 }
 
 pub(crate) fn begin_commands() -> Result<()> {
+    // Use FFI backend for now
     let ok = unsafe { ffi::ds4_metal_begin_commands() };
     if ok == 0 {
         bail!("ds4_metal_begin_commands failed")
     }
     Ok(())
+}
+
+pub(crate) fn end_commands() -> Result<()> {
+    // Use FFI backend for now
+    let ok = unsafe { ffi::ds4_metal_end_commands() };
+    if ok == 0 {
+        bail!("ds4_metal_end_commands failed")
+    }
+    Ok(())
+}
+
+pub(crate) fn synchronize() -> Result<()> {
+    // Use FFI backend for now
+    let ok = unsafe { ffi::ds4_metal_synchronize() };
+    if ok == 0 {
+        bail!("ds4_metal_synchronize failed")
+    }
+    Ok(())
+}
+
+pub(crate) fn cleanup() {
+    // Use FFI backend for now
+    unsafe { ffi::ds4_metal_cleanup() }
+}
+
+// Fallback to C for functions not yet ported
+pub(crate) fn tensor_alloc(bytes: u64) -> *mut ffi::ds4_metal_tensor {
+    unsafe { ffi::ds4_metal_tensor_alloc(bytes) }
 }
 
 pub(crate) fn buffer_alloc(bytes: u64) -> *mut c_void {
@@ -93,27 +120,6 @@ pub(crate) fn tensor_read(
     unsafe { ffi::ds4_metal_tensor_read(tensor, offset, data, bytes) }
 }
 
-pub(crate) fn end_commands() -> Result<()> {
-    let ok = unsafe { ffi::ds4_metal_end_commands() };
-    if ok == 0 {
-        bail!("ds4_metal_end_commands failed")
-    }
-    Ok(())
-}
-
-pub(crate) fn synchronize() -> Result<()> {
-    let ok = unsafe { ffi::ds4_metal_synchronize() };
-    if ok == 0 {
-        bail!("ds4_metal_synchronize failed")
-    }
-    Ok(())
-}
-
-pub(crate) fn cleanup() {
-    unsafe { ffi::ds4_metal_cleanup() }
-}
-
-// Note: This wrapper is called with MetalTensor references on macOS
 #[cfg(target_os = "macos")]
 pub(crate) fn rms_norm_plain_tensor(
     out: &crate::MetalTensor,
@@ -140,27 +146,4 @@ pub(crate) fn rms_norm_plain_tensor(
     eps: f32,
 ) -> i32 {
     unsafe { ffi::ds4_metal_rms_norm_plain_rows_tensor(out, x, n, 1, eps) }
-}
-
-// ============================================================================
-// NATIVE RUST TENSOR IMPLEMENTATIONS (Porting Cluster: Tensor Lifecycle)
-// ============================================================================
-// These functions gradually replace the C equivalents in ds4_metal.m
-// Eventually, build.rs won't need to compile ds4_metal.m for these
-
-#[cfg(target_os = "macos")]
-pub(crate) mod native {
-    use super::*;
-    use crate::metal_native::NativeMetalTensor;
-    
-    /// Native Rust tensor allocation (replaces ds4_metal_tensor_alloc)
-    /// Allocates GPU memory directly via Metal
-    pub fn tensor_alloc(bytes: u64) -> Option<NativeMetalTensor> {
-        NativeMetalTensor::new(bytes)
-    }
-    
-    /// Native tensor view (replaces ds4_metal_tensor_view)
-    pub fn tensor_view(base: &NativeMetalTensor, offset: u64, bytes: u64) -> Option<NativeMetalTensor> {
-        base.view(offset, bytes)
-    }
 }
