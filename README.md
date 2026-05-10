@@ -174,6 +174,38 @@ header is sent first, then parameter bytes are forwarded as
 Anthropic endpoint streams thinking and text live, then emits structured
 `tool_use` blocks when the generated tool block is complete.
 
+### Tool call handling and canonicalization
+
+DeepSeek V4 Flash emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that
+same text back on the next request: they send normalized OpenAI/Anthropic JSON
+tool-call objects. **If the server re-rendered those objects slightly
+differently, the token prefix would no longer match the live KV checkpoint** and
+the next turn would have to be rebuilt.
+
+The first line of defense is exact replay. Every tool call gets an unguessable
+API tool ID, and the server remembers `tool id -> exact sampled DSML block` in
+a bounded in-memory map backed by radix trees. When the client later sends that
+tool ID back, the prompt renderer uses the exact DSML bytes the model sampled,
+not a freshly formatted approximation. This map can also be saved inside KV
+cache files, so exact replay survives server restarts for cached histories.
+
+**Canonicalization is only the backup path**. If the exact DSML block is missing,
+or exact replay is disabled with `--disable-exact-dsml-tool-replay`, the server
+renders a deterministic DSML form from the JSON tool object. After a tool-call
+turn, it compares the live sampled token stream with the prompt that the next
+client request will render. If needed, it rewrites the live checkpoint, or
+falls back to an older disk KV snapshot and replays only the suffix. This keeps
+the model continuation aligned with the stateless API transcript.
+
+During generation, the server also treats DSML syntax differently from payload.
+When the model is emitting stable protocol structure such as DSML tags,
+parameter headers, JSON punctuation, or closing markers, sampling is forced to
+`temperature=0` so the tool call stays parseable. This greedy mode does **not**
+apply to argument payloads: `string=true` parameter bodies and JSON string
+values, including file contents and edit text, use the request's normal sampling
+settings. That separation is important: deterministic decoding is helpful for
+syntax, but can create repeated text when applied to long code or file bodies.
+
 Minimal OpenAI example:
 
 ```sh
