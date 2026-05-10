@@ -9,10 +9,6 @@ name = "ds4_rust"
 path = "src/lib.rs"
 
 [[bin]]
-name = "download-model-rs"
-path = "src/bin/download-model.rs"
-
-[[bin]]
 name = "ds4f"
 path = "src/bin/ds4f.rs"
 

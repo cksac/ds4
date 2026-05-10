@@ -3901,6 +3901,55 @@ impl<'a> RustSession<'a> {
         &self.logits
     }
 
+    pub fn argmax_token(&self) -> i32 {
+        if self.logits.is_empty() {
+            -1
+        } else {
+            sample_argmax(&self.logits)
+        }
+    }
+
+    pub fn top_logprobs(&self, n: usize) -> Vec<(i32, f32)> {
+        if self.logits.is_empty() || n == 0 {
+            return Vec::new();
+        }
+        let max_l = self
+            .logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        if !max_l.is_finite() {
+            return Vec::new();
+        }
+        let sum_exp: f32 = self
+            .logits
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .map(|l| (l - max_l).exp())
+            .sum();
+        if sum_exp <= 0.0 || !sum_exp.is_finite() {
+            return Vec::new();
+        }
+        let log_sum_exp = sum_exp.ln() + max_l;
+        let mut pairs: Vec<(i32, f32)> = self
+            .logits
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                if l.is_finite() {
+                    Some((i as i32, l - log_sum_exp))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        pairs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        pairs.truncate(n);
+        pairs
+    }
+
     pub fn cache(&self) -> &RustKvCache {
         &self.cache
     }
