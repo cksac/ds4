@@ -2712,6 +2712,86 @@ static void tool_call_json_args_add(buf *args, const char *name, const char *val
     }
 }
 
+/* DSML produced by the model is usually a flat list of typed parameters:
+ *
+ *   <parameter name="path" string="true">/tmp/x</parameter>
+ *   <parameter name="timeout" string="false">10</parameter>
+ *
+ * Long generations sometimes drift into a looser XML-ish shape, omitting the
+ * outer string attribute and putting child parameters inside it.  The server
+ * does not know client tool schemas, so it cannot make that semantically
+ * perfect.  Still, returning a structured JSON value lets the client/tool layer
+ * reject or repair the call, which is much better than aborting the assistant
+ * turn and losing the whole sampled continuation.
+ */
+static bool dsml_parse_leaf_param_json(const char **p_in, const char *param_start,
+                                       const char *param_end, buf *out) {
+    const char *p = *p_in;
+    if (strncmp(p, param_start, strlen(param_start)) != 0) return false;
+    const char *tag_end = strchr(p, '>');
+    if (!tag_end) return false;
+
+    char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
+    char *name = dsml_attr(tag, "name");
+    char *is_string = dsml_attr(tag, "string");
+    free(tag);
+    if (!name) {
+        free(is_string);
+        return false;
+    }
+
+    const char *value_start = tag_end + 1;
+    const char *value_end = strstr(value_start, param_end);
+    if (!value_end) {
+        free(name);
+        free(is_string);
+        return false;
+    }
+
+    char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
+    const char *type = is_string ? is_string : "true";
+    char *value = !strcmp(type, "true") ?
+        dsml_unescape_text(raw_value) : xstrdup(raw_value);
+    tool_call_json_args_add(out, name, value, type);
+
+    free(name);
+    free(is_string);
+    free(raw_value);
+    free(value);
+    *p_in = value_end + strlen(param_end);
+    return true;
+}
+
+static bool dsml_parse_nested_params_object(const char **p_in,
+                                            const char *param_start,
+                                            const char *param_end,
+                                            buf *out) {
+    const char *p = *p_in;
+    buf members = {0};
+    bool any = false;
+
+    for (;;) {
+        p = skip_ascii_ws(p);
+        if (strncmp(p, param_start, strlen(param_start)) != 0) break;
+        if (!dsml_parse_leaf_param_json(&p, param_start, param_end, &members)) {
+            buf_free(&members);
+            return false;
+        }
+        any = true;
+    }
+
+    if (!any) {
+        buf_free(&members);
+        return false;
+    }
+    buf_putc(out, '{');
+    buf_puts(out, members.ptr ? members.ptr : "");
+    buf_putc(out, '}');
+    buf_free(&members);
+    *p_in = p;
+    return true;
+}
+
 static void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out) {
     char *s = xstrndup(text ? text : "", n);
     char *body = s;
@@ -2823,7 +2903,7 @@ static bool parse_generated_message(const char *text, char **content_out,
             char *param_name = dsml_attr(tag, "name");
             char *param_is_string = dsml_attr(tag, "string");
             free(tag);
-            if (!param_name || !param_is_string) {
+            if (!param_name) {
                 free(name);
                 free(param_name);
                 free(param_is_string);
@@ -2831,6 +2911,30 @@ static bool parse_generated_message(const char *text, char **content_out,
                 return false;
             }
             const char *value_start = tag_end + 1;
+            if (!param_is_string &&
+                !strncmp(skip_ascii_ws(value_start), param_start, strlen(param_start)))
+            {
+                buf nested = {0};
+                const char *nested_p = value_start;
+                if (!dsml_parse_nested_params_object(&nested_p, param_start,
+                                                     param_end, &nested)) {
+                    free(name);
+                    free(param_name);
+                    buf_free(&nested);
+                    buf_free(&args);
+                    return false;
+                }
+                tool_call_json_args_add(&args, param_name,
+                                        nested.ptr ? nested.ptr : "{}",
+                                        "false");
+                buf_free(&nested);
+                p = skip_ascii_ws(nested_p);
+                if (!strncmp(p, param_end, strlen(param_end))) {
+                    p += strlen(param_end);
+                }
+                free(param_name);
+                continue;
+            }
             const char *value_end = strstr(value_start, param_end);
             if (!value_end) {
                 free(name);
@@ -2840,9 +2944,10 @@ static bool parse_generated_message(const char *text, char **content_out,
                 return false;
             }
             char *raw_value = xstrndup(value_start, (size_t)(value_end - value_start));
-            char *value = param_is_string && !strcmp(param_is_string, "true") ?
+            const char *type = param_is_string ? param_is_string : "true";
+            char *value = !strcmp(type, "true") ?
                 dsml_unescape_text(raw_value) : xstrdup(raw_value);
-            tool_call_json_args_add(&args, param_name, value, param_is_string);
+            tool_call_json_args_add(&args, param_name, value, type);
             free(param_name);
             free(param_is_string);
             free(raw_value);
@@ -8691,6 +8796,35 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     request_free(&r);
 }
 
+static void test_dsml_parser_recovers_loose_nested_parameters(void) {
+    const char *generated =
+        "review done\n\n"
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"edit\">\n"
+        DS4_PARAM_START " name=\"path\">/private/tmp/tetris.c" DS4_PARAM_END "\n"
+        DS4_PARAM_START " name=\"edits\">\n"
+        DS4_PARAM_START " name=\"oldText\" string=\"true\">old &lt;text&gt;" DS4_PARAM_END "\n"
+        DS4_PARAM_START " name=\"newText\" string=\"true\">new text" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &calls));
+    TEST_ASSERT(content && !strcmp(content, "review done"));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "edit"));
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/private/tmp/tetris.c\"") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"edits\": {") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"oldText\":\"old <text>\"") != NULL);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"newText\":\"new text\"") != NULL);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
 static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     tool_schema_orders orders = make_bash_order();
     const char *tool_schemas =
@@ -9606,6 +9740,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
+    test_dsml_parser_recovers_loose_nested_parameters();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
