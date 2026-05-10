@@ -303,6 +303,10 @@ static double ds4_metal_now_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 }
 
+bool ds4_log_is_tty(FILE *fp) {
+    return fp && isatty(fileno(fp));
+}
+
 static int ds4_metal_progress_enabled(void) {
     return ds4_log_is_tty(stderr);
 }
@@ -3744,6 +3748,67 @@ int ds4_metal_init(void) {
     return 1;
 }
 
+void *ds4_metal_buffer_alloc(uint64_t bytes) {
+    if (!g_initialized && !ds4_metal_init()) return NULL;
+    if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
+
+    @autoreleasepool {
+        id<MTLBuffer> buffer = [g_device newBufferWithLength:(NSUInteger)bytes
+                                                     options:MTLResourceStorageModeShared];
+        if (!buffer) {
+            return NULL;
+        }
+        return (__bridge_retained void *)buffer;
+    }
+}
+
+ds4_metal_tensor *ds4_metal_tensor_bind_owned_buffer(void *buffer, uint64_t bytes) {
+    if (!buffer || bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
+
+    id<MTLBuffer> base = (__bridge id<MTLBuffer>)buffer;
+    if (!base) return NULL;
+    if (bytes > (uint64_t)[base length]) return NULL;
+
+    @autoreleasepool {
+        DS4MetalTensor *tensor = [DS4MetalTensor new];
+        tensor.buffer = base;
+        tensor.offset = 0;
+        tensor.bytes = bytes;
+        tensor.owner = 1;
+        g_tensor_alloc_live_bytes += bytes;
+        if (g_tensor_alloc_live_bytes > g_tensor_alloc_peak_bytes) {
+            g_tensor_alloc_peak_bytes = g_tensor_alloc_live_bytes;
+        }
+        if (ds4_metal_trace_allocs()) {
+            fprintf(stderr,
+                    "ds4: Metal tensor alloc %.3f MiB live %.3f MiB peak %.3f MiB\n",
+                    (double)bytes / (1024.0 * 1024.0),
+                    (double)g_tensor_alloc_live_bytes / (1024.0 * 1024.0),
+                    (double)g_tensor_alloc_peak_bytes / (1024.0 * 1024.0));
+        }
+        return (__bridge_retained ds4_metal_tensor *)tensor;
+    }
+}
+
+ds4_metal_tensor *ds4_metal_tensor_wrap_buffer(void *buffer, uint64_t offset, uint64_t bytes) {
+    if (!buffer) return NULL;
+
+    id<MTLBuffer> base = (__bridge id<MTLBuffer>)buffer;
+    if (!base) return NULL;
+    const uint64_t base_bytes = (uint64_t)[base length];
+    if (offset > base_bytes || bytes > base_bytes - offset) return NULL;
+    if (offset > (uint64_t)NSUIntegerMax) return NULL;
+
+    @autoreleasepool {
+        DS4MetalTensor *tensor = [DS4MetalTensor new];
+        tensor.buffer = base;
+        tensor.offset = offset;
+        tensor.bytes = bytes;
+        tensor.owner = 0;
+        return (__bridge_retained ds4_metal_tensor *)tensor;
+    }
+}
+
 ds4_metal_tensor *ds4_metal_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_metal_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
@@ -3822,12 +3887,6 @@ uint64_t ds4_metal_tensor_bytes(const ds4_metal_tensor *tensor) {
     return obj.bytes;
 }
 
-void *ds4_metal_tensor_contents(ds4_metal_tensor *tensor) {
-    if (!tensor) return NULL;
-    DS4MetalTensor *obj = ds4_metal_tensor_obj(tensor);
-    return (uint8_t *)[obj.buffer contents] + obj.offset;
-}
-
 int ds4_metal_tensor_write(ds4_metal_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || (!data && bytes != 0)) return 0;
     DS4MetalTensor *obj = ds4_metal_tensor_obj(tensor);
@@ -3848,54 +3907,11 @@ int ds4_metal_tensor_read(const ds4_metal_tensor *tensor, uint64_t offset, void 
     return 1;
 }
 
-int ds4_metal_tensor_copy(ds4_metal_tensor *dst, uint64_t dst_offset,
-                          const ds4_metal_tensor *src, uint64_t src_offset,
-                          uint64_t bytes) {
-    if (!dst || !src) return 0;
-    if (!g_initialized && !ds4_metal_init()) return 0;
-    DS4MetalTensor *d = ds4_metal_tensor_obj(dst);
-    const DS4MetalTensor *s = ds4_metal_tensor_const_obj(src);
-    if (dst_offset > d.bytes || bytes > d.bytes - dst_offset) return 0;
-    if (src_offset > s.bytes || bytes > s.bytes - src_offset) return 0;
-    if (bytes == 0) return 1;
-    if (!g_batch_cb) return 0;
-
-    ds4_metal_close_batch_encoder();
-    id<MTLBlitCommandEncoder> blit = [g_batch_cb blitCommandEncoder];
-    if (!blit) return 0;
-    [blit copyFromBuffer:s.buffer
-            sourceOffset:(NSUInteger)(s.offset + src_offset)
-                toBuffer:d.buffer
-       destinationOffset:(NSUInteger)(d.offset + dst_offset)
-                    size:(NSUInteger)bytes];
-    [blit endEncoding];
-    return 1;
-}
-
 int ds4_metal_begin_commands(void) {
     if (!g_initialized && !ds4_metal_init()) return 0;
     if (g_batch_cb) return 0;
     g_batch_cb = [g_queue commandBuffer];
     return g_batch_cb != nil;
-}
-
-int ds4_metal_flush_commands(void) {
-    if (!g_initialized && !ds4_metal_init()) return 0;
-    if (!g_batch_cb) return 0;
-
-    ds4_metal_close_batch_encoder();
-    id<MTLCommandBuffer> cb = g_batch_cb;
-    g_batch_cb = nil;
-    [cb commit];
-    [g_pending_cbs addObject:cb];
-
-    g_batch_cb = [g_queue commandBuffer];
-    if (!g_batch_cb) {
-        (void)ds4_metal_wait_pending_command_buffers("command batch");
-        [g_transient_buffers removeAllObjects];
-        return 0;
-    }
-    return 1;
 }
 
 int ds4_metal_end_commands(void) {
@@ -4068,6 +4084,15 @@ void ds4_metal_cleanup(void) {
         g_device = nil;
         g_initialized = 0;
     }
+}
+
+// Getter for Metal device - used during Rust porting for direct GPU access
+id<MTLDevice> ds4_metal_get_device(void) {
+    return g_device;
+}
+
+id<MTLCommandQueue> ds4_metal_get_queue(void) {
+    return g_queue;
 }
 
 static int ds4_metal_encode_get_rows_f16(
@@ -4366,10 +4391,6 @@ int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, ui
                 g_model_view_count);
         return 1;
     }
-}
-
-int ds4_metal_set_model_map(const void *model_map, uint64_t model_size) {
-    return ds4_metal_set_model_map_range(model_map, model_size, 0, model_size);
 }
 
 static id<MTLBuffer> ds4_metal_wrap_model_range(
@@ -5422,14 +5443,6 @@ int ds4_metal_repeat_hc_tensor(
     }
 
     return 1;
-}
-
-int ds4_metal_rms_norm_plain_tensor(
-        ds4_metal_tensor       *out,
-        const ds4_metal_tensor *x,
-        uint32_t                n,
-        float                   eps) {
-    return ds4_metal_rms_norm_plain_rows_tensor(out, x, n, 1, eps);
 }
 
 int ds4_metal_rms_norm_plain_rows_tensor(

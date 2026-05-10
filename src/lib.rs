@@ -1,13 +1,20 @@
 mod gguf;
 mod ffi;
+mod metal_runtime;
+#[cfg(target_os = "macos")]
+mod metal_native;
 
 use gguf::{
     validate_model_config_bytes, BoundTensor, Ds4LayerTensorBindings, Ds4MtpTensorBindings,
     Ds4TensorBindings, GgufMap, ModelSummary, TensorDirectory, TokenizerMetadata,
 };
-use std::ffi::CString;
-use std::ptr::{self, NonNull};
-use std::slice;
+#[cfg(target_os = "macos")]
+use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
+use objc2::runtime::ProtocolObject;
+#[cfg(target_os = "macos")]
+use objc2_metal::MTLBuffer;
+use std::ptr::NonNull;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -42,12 +49,10 @@ const DS4_ROPE_ORIG_CTX: u64 = 65_536;
 const DS4_N_EMBD: usize = 4096;
 const DS4_N_HEAD: u32 = 64;
 const DS4_N_HEAD_KV: u32 = 1;
-const DS4_N_LORA_Q: u32 = 1024;
 const DS4_N_LORA_O: u32 = 1024;
 const DS4_N_OUT_GROUP: u32 = 8;
 const DS4_N_EXPERT: u32 = 256;
 const DS4_N_INDEXER_HEAD: u32 = 64;
-const DS4_N_FF_EXP: u32 = 2048;
 const DS4_N_HEAD_DIM: u64 = 512;
 const DS4_N_INDEXER_HEAD_DIM: u64 = 128;
 const DS4_N_INDEXER_TOP_K: u64 = 512;
@@ -70,13 +75,6 @@ pub enum Backend {
 }
 
 impl Backend {
-    fn into_ffi(self) -> ffi::ds4_backend {
-        match self {
-            Self::Metal => ffi::ds4_backend::DS4_BACKEND_METAL,
-            Self::Cpu => ffi::ds4_backend::DS4_BACKEND_CPU,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Metal => "metal",
@@ -86,30 +84,136 @@ impl Backend {
 }
 
 // Safe wrapper for a Metal device tensor. The pointer is always non-null.
-// Drop calls ds4_metal_tensor_free, which is safe for both owned tensors and
-// view tensors (views reference the same MTLBuffer via ARC; freeing only
-// releases the wrapper struct, not the underlying device memory).
+// On macOS, Rust owns the underlying MTLBuffer through objc2-metal and keeps
+// a lightweight native view wrapper only for the existing kernel ABI.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct MetalTensor {
+    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+    ptr: NonNull<ffi::ds4_metal_tensor>,
+    offset: u64,
+    bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MetalTensor {
+    fn drop(&mut self) {
+        metal_runtime::tensor_free(self.ptr.as_ptr())
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for MetalTensor {}
+
+#[cfg(target_os = "macos")]
+impl MetalTensor {
+    fn alloc(bytes: u64) -> Option<Self> {
+        let raw_buffer = metal_runtime::buffer_alloc(bytes);
+        let buffer = unsafe {
+            Retained::from_raw(raw_buffer.cast::<ProtocolObject<dyn MTLBuffer>>())
+        }?;
+        let raw_view = metal_runtime::tensor_bind_owned_buffer(
+            Retained::as_ptr(&buffer) as *const _ as *mut _,
+            bytes,
+        );
+        let ptr = NonNull::new(raw_view)?;
+        Some(Self {
+            buffer,
+            ptr,
+            offset: 0,
+            bytes,
+        })
+    }
+
+    fn view(base: &Self, offset: u64, bytes: u64) -> Option<Self> {
+        if offset > base.bytes || bytes > base.bytes - offset {
+            return None;
+        }
+        let buffer = base.buffer.clone();
+        let raw_view = metal_runtime::tensor_wrap_buffer(
+            Retained::as_ptr(&buffer) as *const _ as *mut _,
+            base.offset + offset,
+            bytes,
+        );
+        let ptr = NonNull::new(raw_view)?;
+        Some(Self {
+            buffer,
+            ptr,
+            offset: base.offset + offset,
+            bytes,
+        })
+    }
+
+    fn as_ptr(&self) -> *mut ffi::ds4_metal_tensor {
+        self.ptr.as_ptr()
+    }
+
+    fn as_const_ptr(&self) -> *const ffi::ds4_metal_tensor {
+        self.ptr.as_ptr() as *const _
+    }
+
+    pub(crate) fn metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.buffer
+    }
+
+    pub(crate) fn metal_offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub(crate) fn metal_bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn read_f32(&self, out: &mut Vec<f32>) -> bool {
+        let byte_len = out.len().saturating_mul(std::mem::size_of::<f32>());
+        if byte_len == 0 {
+            return true;
+        }
+        unsafe {
+            let src = (self.buffer.contents().as_ptr() as *const u8).add(self.offset as usize);
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr() as *mut u8, byte_len);
+        }
+        true
+    }
+
+    fn write_f32(&self, data: &[f32]) -> bool {
+        let byte_len = data.len().saturating_mul(std::mem::size_of::<f32>());
+        if byte_len == 0 {
+            return true;
+        }
+        unsafe {
+            let dst = (self.buffer.contents().as_ptr() as *mut u8).add(self.offset as usize);
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, dst, byte_len);
+        }
+        true
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 #[derive(Debug)]
 struct MetalTensor {
     ptr: NonNull<ffi::ds4_metal_tensor>,
 }
 
+#[cfg(not(target_os = "macos"))]
 impl Drop for MetalTensor {
     fn drop(&mut self) {
-        unsafe { ffi::ds4_metal_tensor_free(self.ptr.as_ptr()) }
+        metal_runtime::tensor_free(self.ptr.as_ptr())
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 unsafe impl Send for MetalTensor {}
 
+#[cfg(not(target_os = "macos"))]
 impl MetalTensor {
     fn alloc(bytes: u64) -> Option<Self> {
-        let ptr = unsafe { ffi::ds4_metal_tensor_alloc(bytes) };
+        let ptr = metal_runtime::tensor_alloc(bytes);
         NonNull::new(ptr).map(|ptr| Self { ptr })
     }
 
     fn view(base: &Self, offset: u64, bytes: u64) -> Option<Self> {
-        let ptr = unsafe { ffi::ds4_metal_tensor_view(base.ptr.as_ptr(), offset, bytes) };
+        let ptr = metal_runtime::tensor_view(base.ptr.as_ptr(), offset, bytes);
         NonNull::new(ptr).map(|ptr| Self { ptr })
     }
 
@@ -126,28 +230,24 @@ impl MetalTensor {
         if n == 0 {
             return true;
         }
-        unsafe {
-            ffi::ds4_metal_tensor_read(
-                self.as_const_ptr(),
-                0,
-                out.as_mut_ptr() as *mut _,
-                (n * 4) as u64,
-            ) != 0
-        }
+        metal_runtime::tensor_read(
+            self.as_const_ptr(),
+            0,
+            out.as_mut_ptr() as *mut _,
+            (n * 4) as u64,
+        ) != 0
     }
 
     fn write_f32(&self, data: &[f32]) -> bool {
         if data.is_empty() {
             return true;
         }
-        unsafe {
-            ffi::ds4_metal_tensor_write(
-                self.as_ptr(),
-                0,
-                data.as_ptr() as *const _,
-                (data.len() * 4) as u64,
-            ) != 0
-        }
+        metal_runtime::tensor_write(
+            self.as_ptr(),
+            0,
+            data.as_ptr() as *const _,
+            (data.len() * 4) as u64,
+        ) != 0
     }
 }
 
@@ -226,7 +326,7 @@ impl From<ffi::ds4_context_memory> for ContextMemory {
 
 #[derive(Debug)]
 pub struct Tokens {
-    raw: ffi::ds4_tokens,
+    raw: Vec<i32>,
 }
 
 unsafe impl Send for Tokens {}
@@ -239,49 +339,27 @@ impl Default for Tokens {
 
 impl Tokens {
     pub fn new() -> Self {
-        Self {
-            raw: ffi::ds4_tokens {
-                v: ptr::null_mut(),
-                len: 0,
-                cap: 0,
-            },
-        }
+        Self { raw: Vec::new() }
     }
 
     pub fn len(&self) -> i32 {
-        self.raw.len
+        i32::try_from(self.raw.len()).unwrap_or(i32::MAX)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.raw.len == 0
+        self.raw.is_empty()
     }
 
     pub fn as_slice(&self) -> &[i32] {
-        if self.raw.len <= 0 {
-            &[]
-        } else {
-            unsafe { slice::from_raw_parts(self.raw.v, self.raw.len as usize) }
-        }
+        &self.raw
     }
 
     pub fn push(&mut self, token: i32) {
-        unsafe { ffi::ds4_tokens_push(&mut self.raw, token) }
+        self.raw.push(token)
     }
 
     pub fn extend_from(&mut self, other: &Tokens) {
-        for token in other.as_slice() {
-            self.push(*token);
-        }
-    }
-
-    fn as_ptr(&self) -> *const ffi::ds4_tokens {
-        &self.raw
-    }
-}
-
-impl Drop for Tokens {
-    fn drop(&mut self) {
-        unsafe { ffi::ds4_tokens_free(&mut self.raw) }
+        self.raw.extend_from_slice(other.as_slice())
     }
 }
 
@@ -438,7 +516,7 @@ struct MetalDecodeGraph {
     // Ring / sliding-window parameters
     raw_cap: u32,
     raw_window: u32,
-    comp_cap: u32,
+    _comp_cap: u32,
     vocab_dim: u64,
 }
 
@@ -818,94 +896,8 @@ const IQ2XXS_GRID: [u64; 256] = [
     0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
 ];
 
-fn ffi_bound_tensor(binding: Option<&BoundTensor>) -> ffi::ds4_bound_tensor_ref {
-    let Some(binding) = binding else {
-        return ffi::ds4_bound_tensor_ref::default();
-    };
-
-    debug_assert!(binding.descriptor.dims.len() <= ffi::DS4_MAX_DIMS);
-    let mut dim = [0u64; ffi::DS4_MAX_DIMS];
-    dim[..binding.descriptor.dims.len()].copy_from_slice(&binding.descriptor.dims);
-
-    ffi::ds4_bound_tensor_ref {
-        present: true,
-        ndim: binding.descriptor.ndim,
-        dim,
-        tensor_type: binding.descriptor.tensor_type,
-        abs_offset: binding.descriptor.abs_offset,
-        bytes: binding.descriptor.bytes,
-    }
-}
-
-fn ffi_layer_binding(binding: &Ds4LayerTensorBindings) -> ffi::ds4_layer_binding_ref {
-    ffi::ds4_layer_binding_ref {
-        hc_attn_fn: ffi_bound_tensor(Some(&binding.hc_attn_fn)),
-        hc_attn_scale: ffi_bound_tensor(Some(&binding.hc_attn_scale)),
-        hc_attn_base: ffi_bound_tensor(Some(&binding.hc_attn_base)),
-        attn_norm: ffi_bound_tensor(Some(&binding.attn_norm)),
-        attn_q_a: ffi_bound_tensor(Some(&binding.attn_q_a)),
-        attn_q_a_norm: ffi_bound_tensor(Some(&binding.attn_q_a_norm)),
-        attn_q_b: ffi_bound_tensor(Some(&binding.attn_q_b)),
-        attn_kv: ffi_bound_tensor(Some(&binding.attn_kv)),
-        attn_kv_a_norm: ffi_bound_tensor(Some(&binding.attn_kv_a_norm)),
-        attn_sinks: ffi_bound_tensor(Some(&binding.attn_sinks)),
-        attn_output_a: ffi_bound_tensor(Some(&binding.attn_output_a)),
-        attn_output_b: ffi_bound_tensor(Some(&binding.attn_output_b)),
-        attn_compressor_ape: ffi_bound_tensor(binding.attn_compressor_ape.as_ref()),
-        attn_compressor_kv: ffi_bound_tensor(binding.attn_compressor_kv.as_ref()),
-        attn_compressor_gate: ffi_bound_tensor(binding.attn_compressor_gate.as_ref()),
-        attn_compressor_norm: ffi_bound_tensor(binding.attn_compressor_norm.as_ref()),
-        indexer_attn_q_b: ffi_bound_tensor(binding.indexer_attn_q_b.as_ref()),
-        indexer_proj: ffi_bound_tensor(binding.indexer_proj.as_ref()),
-        indexer_compressor_ape: ffi_bound_tensor(binding.indexer_compressor_ape.as_ref()),
-        indexer_compressor_kv: ffi_bound_tensor(binding.indexer_compressor_kv.as_ref()),
-        indexer_compressor_gate: ffi_bound_tensor(binding.indexer_compressor_gate.as_ref()),
-        indexer_compressor_norm: ffi_bound_tensor(binding.indexer_compressor_norm.as_ref()),
-        hc_ffn_fn: ffi_bound_tensor(Some(&binding.hc_ffn_fn)),
-        hc_ffn_scale: ffi_bound_tensor(Some(&binding.hc_ffn_scale)),
-        hc_ffn_base: ffi_bound_tensor(Some(&binding.hc_ffn_base)),
-        ffn_norm: ffi_bound_tensor(Some(&binding.ffn_norm)),
-        ffn_gate_tid2eid: ffi_bound_tensor(binding.ffn_gate_tid2eid.as_ref()),
-        ffn_gate_inp: ffi_bound_tensor(Some(&binding.ffn_gate_inp)),
-        ffn_exp_probs_b: ffi_bound_tensor(binding.ffn_exp_probs_b.as_ref()),
-        ffn_gate_exps: ffi_bound_tensor(Some(&binding.ffn_gate_exps)),
-        ffn_up_exps: ffi_bound_tensor(Some(&binding.ffn_up_exps)),
-        ffn_down_exps: ffi_bound_tensor(Some(&binding.ffn_down_exps)),
-        ffn_gate_shexp: ffi_bound_tensor(Some(&binding.ffn_gate_shexp)),
-        ffn_up_shexp: ffi_bound_tensor(Some(&binding.ffn_up_shexp)),
-        ffn_down_shexp: ffi_bound_tensor(Some(&binding.ffn_down_shexp)),
-    }
-}
-
-fn ffi_model_bindings(binding: &Ds4TensorBindings) -> ffi::ds4_weights_binding_ref {
-    ffi::ds4_weights_binding_ref {
-        token_embd: ffi_bound_tensor(Some(&binding.token_embd)),
-        output_hc_base: ffi_bound_tensor(Some(&binding.output_hc_base)),
-        output_hc_fn: ffi_bound_tensor(Some(&binding.output_hc_fn)),
-        output_hc_scale: ffi_bound_tensor(Some(&binding.output_hc_scale)),
-        output_norm: ffi_bound_tensor(Some(&binding.output_norm)),
-        output: ffi_bound_tensor(Some(&binding.output)),
-        layer: std::array::from_fn(|index| ffi_layer_binding(&binding.layers[index])),
-    }
-}
-
-fn ffi_mtp_bindings(binding: &Ds4MtpTensorBindings) -> ffi::ds4_mtp_weights_binding_ref {
-    ffi::ds4_mtp_weights_binding_ref {
-        e_proj: ffi_bound_tensor(Some(&binding.e_proj)),
-        h_proj: ffi_bound_tensor(Some(&binding.h_proj)),
-        enorm: ffi_bound_tensor(Some(&binding.enorm)),
-        hnorm: ffi_bound_tensor(Some(&binding.hnorm)),
-        norm: ffi_bound_tensor(Some(&binding.norm)),
-        hc_head_base: ffi_bound_tensor(Some(&binding.hc_head_base)),
-        hc_head_fn: ffi_bound_tensor(Some(&binding.hc_head_fn)),
-        hc_head_scale: ffi_bound_tensor(Some(&binding.hc_head_scale)),
-        block: ffi_layer_binding(&binding.block),
-    }
-}
-
 #[derive(Debug)]
 pub struct Engine {
-    ptr: NonNull<ffi::ds4_engine>,
     backend: Backend,
     model_map: GgufMap,
     #[allow(dead_code)]
@@ -918,6 +910,8 @@ pub struct Engine {
     mtp_tensor_bindings: Option<Ds4MtpTensorBindings>,
     tokenizer: TokenizerMetadata,
     special_tokens: SpecialTokens,
+    eos_token: i32,
+    mtp_draft_tokens: i32,
     mtp_margin: f32,
     quality: bool,
 }
@@ -973,60 +967,38 @@ impl Engine {
                 tensor_directory.bind_ds4_mtp_tensors()
             })
             .transpose()?;
-        let model_path = CString::new(options.model_path.as_str())
-            .context("model path contains an embedded NUL byte")?;
-        let mtp_path = options
-            .mtp_path
-            .as_deref()
-            .map(CString::new)
-            .transpose()
-            .context("mtp path contains an embedded NUL byte")?;
-
-        let ffi_options = ffi::ds4_engine_options {
-            model_path: model_path.as_ptr(),
-            mtp_path: mtp_path.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
-            backend: options.backend.into_ffi(),
-            n_threads: options.n_threads,
-            mtp_draft_tokens: options.mtp_draft_tokens,
-            mtp_margin: options.mtp_margin,
-            warm_weights: options.warm_weights,
-            quality: options.quality,
-        };
-        let model_mapping = ffi::ds4_gguf_map {
-            map: model_map.as_ptr(),
-            size: model_map.len_u64(),
-        };
-        let mtp_mapping = mtp_map.as_ref().map(|map| ffi::ds4_gguf_map {
-            map: map.as_ptr(),
-            size: map.len_u64(),
-        });
-        let ffi_tensor_bindings = ffi_model_bindings(&tensor_bindings);
-        let ffi_mtp_tensor_bindings = mtp_tensor_bindings.as_ref().map(ffi_mtp_bindings);
-
-        let mut out = ptr::null_mut();
-        let rc = unsafe {
-            ffi::ds4_engine_open_prebound_mapped(
-                &mut out,
-                &ffi_options,
-                &model_mapping,
-                &ffi_tensor_bindings,
-                mtp_mapping
-                    .as_ref()
-                    .map_or(ptr::null(), |mapping| mapping as *const _),
-                ffi_mtp_tensor_bindings
-                    .as_ref()
-                    .map_or(ptr::null(), |binding| binding as *const _),
-            )
-        };
-        if rc != 0 || out.is_null() {
-            bail!("failed to open engine")
+        if options.backend == Backend::Metal {
+            let model_range_offset = tensor_directory.tensor_data_pos();
+            let model_range_size = model_map
+                .len_u64()
+                .checked_sub(model_range_offset)
+                .context("model tensor data offset exceeds mapped model size")?;
+            let mut model_ranges = vec![metal_runtime::ModelMapRange {
+                model_map: model_map.as_ptr(),
+                model_size: model_map.len_u64(),
+                map_offset: model_range_offset,
+                map_size: model_range_size,
+            }];
+            if let Some(mtp_map) = mtp_map.as_ref() {
+                let mtp_dir = TensorDirectory::from_bytes(mtp_map.as_bytes())?;
+                let mtp_range_offset = mtp_dir.tensor_data_pos();
+                let mtp_range_size = mtp_map
+                    .len_u64()
+                    .checked_sub(mtp_range_offset)
+                    .context("MTP tensor data offset exceeds mapped model size")?;
+                model_ranges.push(metal_runtime::ModelMapRange {
+                    model_map: mtp_map.as_ptr(),
+                    model_size: mtp_map.len_u64(),
+                    map_offset: mtp_range_offset,
+                    map_size: mtp_range_size,
+                });
+            }
+            metal_runtime::initialize(options.quality, &model_ranges)?;
         }
-
-        let ptr = NonNull::new(out).expect("ds4_engine_open returned null without error");
         let special_tokens = SpecialTokens::bootstrap(&tokenizer)?;
+        let eos_token = special_tokens.eos();
 
         Ok(Self {
-            ptr,
             backend: options.backend,
             model_map,
             mtp_map,
@@ -1035,6 +1007,8 @@ impl Engine {
             mtp_tensor_bindings,
             tokenizer,
             special_tokens,
+            eos_token,
+            mtp_draft_tokens: options.mtp_draft_tokens,
             mtp_margin: options.mtp_margin,
             quality: options.quality,
         })
@@ -1050,7 +1024,12 @@ impl Engine {
     }
 
     pub fn dump_tokens(&self, tokens: &Tokens) {
-        unsafe { ffi::ds4_engine_dump_tokens(self.ptr.as_ptr(), tokens.as_ptr()) }
+        eprintln!("{:?}", tokens.as_slice());
+        for token in tokens.as_slice() {
+            let bytes = self.token_bytes(*token);
+            let text = String::from_utf8_lossy(&bytes);
+            eprintln!("{:>6}  {}", token, text);
+        }
     }
 
     pub fn context_memory_estimate(backend: Backend, ctx_size: i32) -> ContextMemory {
@@ -1058,11 +1037,11 @@ impl Engine {
     }
 
     pub fn token_eos(&self) -> i32 {
-        unsafe { ffi::ds4_token_eos(self.ptr.as_ptr()) }
+        self.eos_token
     }
 
     pub fn mtp_draft_tokens(&self) -> i32 {
-        unsafe { ffi::ds4_engine_mtp_draft_tokens(self.ptr.as_ptr()) }
+        self.mtp_draft_tokens
     }
 
     pub fn has_rust_mtp_drafter(&self) -> bool {
@@ -2159,7 +2138,7 @@ impl Engine {
     // Allocate a Metal decode graph for a session of `ctx_size` tokens.
     // `raw_cap` follows the same semantics as new_rust_kv_cache.
     // Returns None if any Metal allocation fails.
-    pub fn new_metal_decode_graph(&self, ctx_size: u32, raw_cap: u32) -> Option<Box<MetalDecodeGraph>> {
+    pub(crate) fn new_metal_decode_graph(&self, ctx_size: u32, raw_cap: u32) -> Option<Box<MetalDecodeGraph>> {
         let cap_raw = if raw_cap == 0 { DS4_N_SWA.min(ctx_size) } else { raw_cap.min(ctx_size).max(1) };
         let raw_window = DS4_N_SWA.min(ctx_size).max(1);
         let min_ratio = 4u32; // smallest non-zero compress_ratio used in the model
@@ -2326,7 +2305,7 @@ impl Engine {
             layers,
             raw_cap: cap_raw,
             raw_window,
-            comp_cap,
+            _comp_cap: comp_cap,
             vocab_dim,
         }))
     }
@@ -2395,7 +2374,7 @@ impl Engine {
     // This is the real Metal execution path: compute stays on the GPU for the
     // full layer stack; only the logits vector and the final HC state leave
     // device memory.
-    pub fn eval_token_with_metal_graph(
+    pub(crate) fn eval_token_with_metal_graph(
         &self,
         metal: &mut MetalDecodeGraph,
         token: i32,
@@ -2410,8 +2389,7 @@ impl Engine {
         let n_raw   = metal.raw_span(pos);
 
         // ---- Begin Metal command encoding -----------------------------------
-        let ok = unsafe { ffi::ds4_metal_begin_commands() };
-        if ok == 0 { bail!("ds4_metal_begin_commands failed") }
+        metal_runtime::begin_commands()?;
 
         // 1. Embed the input token into the initial HC state.
         let n_vocab = weights.token_embd.descriptor.dims[1] as u32;
@@ -2440,16 +2418,14 @@ impl Engine {
         self.metal_encode_output_head(metal)?;
 
         // ---- End command encoding and run on GPU ----------------------------
-        let ok = unsafe { ffi::ds4_metal_end_commands() };
-        if ok == 0 { bail!("ds4_metal_end_commands failed") }
-        let ok = unsafe { ffi::ds4_metal_synchronize() };
-        if ok == 0 { bail!("ds4_metal_synchronize failed") }
+        metal_runtime::end_commands()?;
+        metal_runtime::synchronize()?;
 
         Ok(())
     }
 
     // Read logits out of the Metal graph into a CPU Vec.
-    pub fn metal_graph_read_logits(&self, metal: &MetalDecodeGraph, out: &mut Vec<f32>) -> Result<()> {
+    pub(crate) fn metal_graph_read_logits(&self, metal: &MetalDecodeGraph, out: &mut Vec<f32>) -> Result<()> {
         out.resize(metal.vocab_dim as usize, 0.0);
         if !metal.logits.read_f32(out) {
             bail!("ds4_metal_tensor_read failed for logits")
@@ -2502,9 +2478,8 @@ impl Engine {
         }
 
         // ---- Attention HC pre: flat norm → HC mixer → split+weighted sum+norm
-        ok!(unsafe { ffi::ds4_metal_rms_norm_plain_tensor(
-            metal.flat_hc.as_ptr(), metal.cur_hc.as_const_ptr(),
-            hc_dim, DS4_RMS_EPS) }, "rms_norm_plain");
+        ok!(metal_runtime::rms_norm_plain_tensor(
+            &metal.flat_hc, &metal.cur_hc, hc_dim, DS4_RMS_EPS), "rms_norm_plain");
 
         ok!(unsafe { ffi::ds4_metal_matmul_f16_tensor(
             metal.hc_mix.as_ptr(), model_map, model_size,
@@ -2574,7 +2549,7 @@ impl Engine {
             "kv_fp8_store_raw");
 
         // ---- Compressor / indexer update for compressed layers --------------
-        let (mut n_comp, comp_selected_ptr) = if compressed {
+        let (n_comp, comp_selected_ptr) = if compressed {
             let comp_width  = coff as u64 * DS4_N_HEAD_DIM;
             let emit = ((pos + 1) % ratio) == 0;
 
@@ -2794,9 +2769,9 @@ impl Engine {
         let down_in_dim    = binding.ffn_down_exps.descriptor.dims[0] as u32;
         let routed_out_dim = binding.ffn_down_exps.descriptor.dims[1] as u32;
 
-        ok!(unsafe { ffi::ds4_metal_rms_norm_plain_tensor(
-            metal.flat_hc.as_ptr(), metal.after_attn_hc.as_const_ptr(),
-            hc_dim, DS4_RMS_EPS) }, "rms_norm_plain FFN");
+        ok!(metal_runtime::rms_norm_plain_tensor(
+            &metal.flat_hc, &metal.after_attn_hc, hc_dim, DS4_RMS_EPS),
+            "rms_norm_plain FFN");
 
         ok!(unsafe { ffi::ds4_metal_matmul_f16_tensor(
             metal.hc_mix.as_ptr(), model_map, model_size,
@@ -2909,9 +2884,9 @@ impl Engine {
             }};
         }
 
-        ok!(unsafe { ffi::ds4_metal_rms_norm_plain_tensor(
-            metal.flat_hc.as_ptr(), metal.cur_hc.as_const_ptr(),
-            hc_dim, DS4_RMS_EPS) }, "rms_norm_plain HC");
+        ok!(metal_runtime::rms_norm_plain_tensor(
+            &metal.flat_hc, &metal.cur_hc, hc_dim, DS4_RMS_EPS),
+            "rms_norm_plain HC");
 
         ok!(unsafe { ffi::ds4_metal_matmul_f16_tensor(
             metal.output_pre.as_ptr(), model_map, model_size,
@@ -3465,7 +3440,9 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        unsafe { ffi::ds4_engine_close(self.ptr.as_ptr()) }
+        if self.backend == Backend::Metal {
+            metal_runtime::cleanup()
+        }
     }
 }
 
@@ -6466,6 +6443,10 @@ impl SpecialTokens {
             bytes.starts_with(entry.text.as_bytes())
                 .then_some((entry.text.len(), entry.token))
         })
+    }
+
+    fn eos(&self) -> i32 {
+        self.values[1].token
     }
 }
 

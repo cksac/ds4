@@ -18,23 +18,20 @@ typedef struct ds4_metal_tensor ds4_metal_tensor;
 int ds4_metal_init(void);
 void ds4_metal_cleanup(void);
 
+void *ds4_metal_buffer_alloc(uint64_t bytes);
+ds4_metal_tensor *ds4_metal_tensor_bind_owned_buffer(void *buffer, uint64_t bytes);
+ds4_metal_tensor *ds4_metal_tensor_wrap_buffer(void *buffer, uint64_t offset, uint64_t bytes);
 ds4_metal_tensor *ds4_metal_tensor_alloc(uint64_t bytes);
 ds4_metal_tensor *ds4_metal_tensor_view(const ds4_metal_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_metal_tensor_free(ds4_metal_tensor *tensor);
 uint64_t ds4_metal_tensor_bytes(const ds4_metal_tensor *tensor);
-void *ds4_metal_tensor_contents(ds4_metal_tensor *tensor);
 int ds4_metal_tensor_write(ds4_metal_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_metal_tensor_read(const ds4_metal_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
-int ds4_metal_tensor_copy(ds4_metal_tensor *dst, uint64_t dst_offset,
-                          const ds4_metal_tensor *src, uint64_t src_offset,
-                          uint64_t bytes);
 
 int ds4_metal_begin_commands(void);
-int ds4_metal_flush_commands(void);
 int ds4_metal_end_commands(void);
 int ds4_metal_synchronize(void);
 
-int ds4_metal_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
 void ds4_metal_set_quality(bool quality);
 void ds4_metal_print_memory_report(const char *label);
@@ -184,12 +181,6 @@ int ds4_metal_repeat_hc_tensor(
         const ds4_metal_tensor *row,
         uint32_t                n_embd,
         uint32_t                n_hc);
-
-int ds4_metal_rms_norm_plain_tensor(
-        ds4_metal_tensor       *out,
-        const ds4_metal_tensor *x,
-        uint32_t                n,
-        float                   eps);
 
 int ds4_metal_rms_norm_plain_rows_tensor(
         ds4_metal_tensor       *out,

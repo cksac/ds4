@@ -135,6 +135,12 @@ pub(crate) struct TensorDirectory {
     tensor_data_pos: u64,
 }
 
+impl TensorDirectory {
+    pub(crate) fn tensor_data_pos(&self) -> u64 {
+        self.tensor_data_pos
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct TensorDescriptor {
