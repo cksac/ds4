@@ -5,6 +5,19 @@ use crate::tensor::GpuTensor;
 use crate::gguf::N_HEAD_DIM;
 use crate::metal_args;
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
+
+fn wait_gpu(cb: &CommandBufferRef) -> Result<(), &'static str> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match cb.status() {
+            MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Scheduled => {}
+            _ => return Ok(()),
+        }
+        if Instant::now() >= deadline { return Err("gpu timeout"); }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 const FC_MUL_MV: u64 = 600;
 #[allow(dead_code)]
@@ -69,7 +82,7 @@ fn dispatch_with_args<T: Sized>(
             MTLSize { width: tg_size.0, height: tg_size.1, depth: tg_size.2 });
         enc.end_encoding();
         cb.commit();
-        cb.wait_until_completed();
+        wait_gpu(&cb)?;
         if cb.status() == MTLCommandBufferStatus::Error { Err("kernel failed") } else { Ok(()) }
     }).unwrap()
 }
@@ -445,20 +458,37 @@ pub fn embed_tokens(
         tokens.as_ptr() as *const c_void,
         (tokens.len() * 4) as u64,
         MTLResourceOptions::StorageModeShared);
-    let p = get_or_create_pipeline("kernel_get_rows_f").ok_or("get_rows pipeline")?;
+    use crate::metal_args::GetRowsArgs;
+    let args = GetRowsArgs {
+        ne00t: n_embd as i32,
+        ne00: n_embd as i32,
+        nb01: n_embd as u64 * 2,
+        nb02: 0, nb03: 0,
+        ne10: n_embd as i32,
+        nb10: 4,
+        nb11: 0, nb12: 0,
+        nb1: n_embd as u64 * 4,
+        nb2: 0, nb3: 0,
+    };
+    let abuf = device.new_buffer_with_data(
+        &args as *const GetRowsArgs as *const c_void,
+        std::mem::size_of::<GetRowsArgs>() as u64,
+        MTLResourceOptions::StorageModeShared);
+    let p = get_or_create_pipeline("kernel_get_rows_f16").ok_or("get_rows pipeline")?;
     bridge::with_queue(|queue| {
         let cb = queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&p);
-        enc.set_buffer(0, Some(&wbuf), 0);
-        enc.set_buffer(1, Some(&tbuf), 0);
-        enc.set_buffer(2, Some(&**out.buffer().unwrap()), out.offset_raw());
+        enc.set_buffer(0, Some(&abuf), 0);
+        enc.set_buffer(1, Some(&wbuf), 0);
+        enc.set_buffer(2, Some(&tbuf), 0);
+        enc.set_buffer(3, Some(&**out.buffer().unwrap()), out.offset_raw());
         let n = tokens.len() as u64 * n_embd as u64;
         enc.dispatch_thread_groups(MTLSize { width: (n + 31) / 32, height: 1, depth: 1 },
             MTLSize { width: 32, height: 1, depth: 1 });
         enc.end_encoding();
         cb.commit();
-        cb.wait_until_completed();
+        wait_gpu(&cb)?;
         if cb.status() == MTLCommandBufferStatus::Error { Err("embed failed") } else { Ok(()) }
     }).unwrap()
 }
@@ -500,7 +530,7 @@ pub fn router_weights_one(
             MTLSize { width: 6, height: 1, depth: 1 });
         enc.end_encoding();
         cb.commit();
-        cb.wait_until_completed();
+        wait_gpu(&cb)?;
         if cb.status() == MTLCommandBufferStatus::Error { Err("router weights failed") } else { Ok(()) }
     }).unwrap()
 }
@@ -635,7 +665,8 @@ pub fn matmul_id_iq2_xxs_pair(
         selected.as_ptr() as *const c_void,
         (selected.len() * 4) as u64,
         MTLResourceOptions::StorageModeShared);
-    let p = get_or_create_pipeline("kernel_mul_mv_id_iq2_xxs_pair_f32")
+    let nsg: i16 = if nr0 == 4 { 4 } else { 2 };
+    let p = make_matmul_pipeline("kernel_mul_mv_id_iq2_xxs_pair_f32", nsg, 1)
         .ok_or("iq2 pair pipeline")?;
     dispatch_with_args(&p, &args,
         &[(Some(&wbuf), 0), (Some(&wbuf), (in_dim as u64 / 32 * 66 * out_dim as u64 * n_expert as u64)),
@@ -679,7 +710,7 @@ pub fn matmul_id_q2_K_sum6(
         selected.as_ptr() as *const c_void,
         (selected.len() * 4) as u64,
         MTLResourceOptions::StorageModeShared);
-    let p = get_or_create_pipeline("kernel_mul_mv_id_q2_K_sum6_f32")
+    let p = make_matmul_pipeline("kernel_mul_mv_id_q2_K_sum6_f32", 4, 1)
         .ok_or("q2 sum6 pipeline")?;
     dispatch_with_args(&p, &args,
         &[(Some(&wbuf), 0), (Some(&wbuf), step * n_expert as u64),
@@ -723,7 +754,7 @@ pub fn matmul_id_q4_K_sum6(
         selected.as_ptr() as *const c_void,
         (selected.len() * 4) as u64,
         MTLResourceOptions::StorageModeShared);
-    let p = get_or_create_pipeline("kernel_mul_mv_id_q4_K_sum6_f32")
+    let p = make_matmul_pipeline("kernel_mul_mv_id_q4_K_sum6_f32", 2, 1)
         .ok_or("q4 sum6 pipeline")?;
     dispatch_with_args(&p, &args,
         &[(Some(&wbuf), 0), (Some(&wbuf), step * n_expert as u64),

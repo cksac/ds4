@@ -50,16 +50,21 @@ pub fn init() -> Result<(), Box<dyn std::error::Error>> {
     let queue = device.new_command_queue();
 
     let library: Library;
-    if let Ok(out_dir) = std::env::var("OUT_DIR") {
-        let metallib = std::path::Path::new(&out_dir).join("ds4_kernels.metallib");
-        if metallib.exists() {
-            library = device.new_library_with_file(metallib)?;
-        } else {
-            let source = build_metal_source();
-            let opts = CompileOptions::new();
-            library = device.new_library_with_source(&source, &opts)?;
-        }
+
+    // Try precompiled metallib first (via build.rs), fall back to source compilation
+    let metallib_env = option_env!("DS4_METALLIB_PATH");
+    let precompiled = metallib_env
+        .and_then(|p| if std::path::Path::new(p).exists() { Some(p.to_string()) } else { None })
+        .or_else(|| {
+            std::env::var("OUT_DIR").ok().map(|d| {
+                std::path::Path::new(&d).join("ds4_kernels.metallib").to_string_lossy().to_string()
+            }).filter(|p| std::path::Path::new(p).exists())
+        });
+    if let Some(ref path) = precompiled {
+        eprintln!("ds4: loading precompiled Metal library from {}", path);
+        library = device.new_library_with_file(std::path::Path::new(path))?;
     } else {
+        eprintln!("ds4: compiling Metal library from source");
         let source = build_metal_source();
         let opts = CompileOptions::new();
         library = device.new_library_with_source(&source, &opts)?;

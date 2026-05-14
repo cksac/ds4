@@ -1,29 +1,30 @@
-use std::env;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    let out_dir = env::var("OUT_DIR").unwrap();
-    let dest = PathBuf::from(out_dir);
+    let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    // Re-run if any metal shader changes or this build.rs changes
+    println!("cargo:rerun-if-changed={}/build.rs", root);
+    let metal_dir = Path::new(&root).join("src/metal");
+    if !metal_dir.exists() {
+        return;
+    }
+    for entry in std::fs::read_dir(&metal_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().map_or(false, |ext| ext == "metal") {
+            println!("cargo:rerun-if-changed={}", entry.path().display());
+        }
+    }
 
-    let metal_dir = PathBuf::from("src/metal");
-    let mut metal_files: Vec<PathBuf> = std::fs::read_dir(&metal_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "metal"))
-        .map(|e| e.path())
-        .collect();
-    metal_files.sort();
+    let out_dir = std::env::var("OUT_DIR").unwrap();
 
-    eprintln!("ds4-rs build: concatenating {} metal kernel files", metal_files.len());
-    let mut combined: Vec<u8> = Vec::new();
-    // Include the preamble that ds4_metal.m embeds (types, macros)
-    let preamble = br#"
+    // Build the preamble (must match bridge.rs::build_metal_source)
+    let preamble = "\
 #include <metal_stdlib>
 using namespace metal;
-
-#define MAX(x, y) ((x) > (y) ? (x) : (y))
-#define MIN(x, y) ((x) < (y) ? (x) : (y))
+constant float DS4_M_PI_F = 3.14159265358979323846f;
+#define MAX(x,y) ((x)>(y)?(x):(y))
+#define MIN(x,y) ((x)<(y)?(x):(y))
 #define SWAP(x, y) { auto tmp = (x); (x) = (y); (y) = tmp; }
 #define QK8_0 32
 #define N_SIMDWIDTH 32
@@ -32,73 +33,72 @@ using namespace metal;
 #define FC_MUL_MV 600
 #define FC_MUL_MM 700
 #define FC_BIN 1300
-#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
-#define M_PI_F 3.14159265358979323846f
+#define FC_UNARY 1200
+#define FOR_UNROLL(x) _Pragma(\"clang loop unroll(full)\") for (x)
+struct block_q8_0 { half d; int8_t qs[QK8_0]; };
+enum ds4_sort_order { DS4_SORT_ORDER_ASC, DS4_SORT_ORDER_DESC };
+static void dequantize_f16_t4(device const half4 * src, short il, thread float4 & reg) {
+    reg = (float4)(*src);
+}
+";
 
-struct block_q8_0 {
-    half d;
-    int8_t qs[QK8_0];
-};
-
-enum ds4_sort_order {
-    DS4_SORT_ORDER_ASC,
-    DS4_SORT_ORDER_DESC,
-};
-"#;
-    combined.extend_from_slice(preamble);
-
-    for f in &metal_files {
-        let name = f.file_name().unwrap().to_str().unwrap();
-        let header = format!("\n// >>> {} included by build.rs\n", name);
-        combined.extend(header.as_bytes());
-        let content = std::fs::read(f).unwrap();
-        combined.extend(content);
-        combined.push(b'\n');
+    // Collect and concatenate all .metal files
+    let mut source = preamble.to_string();
+    let mut files: Vec<_> = std::fs::read_dir(metal_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "metal"))
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    for f in &files {
+        let content = std::fs::read_to_string(f).unwrap();
+        source.push_str(&format!("\n// {}\n", f.file_name().unwrap().to_str().unwrap()));
+        source.push_str(&content);
     }
 
-    let combined_path = dest.join("ds4_kernels.metal");
-    std::fs::write(&combined_path, &combined).unwrap();
-    println!("cargo:rerun-if-changed=src/metal/");
-    println!("cargo:rerun-if-changed=build.rs");
+    // Write concatenated source to a temp file
+    let src_path = Path::new(&out_dir).join("ds4_kernels.metal");
+    std::fs::write(&src_path, &source).unwrap();
 
-    // Compile with xcrun metal - compile to .air, then metallib
-    let air_path = dest.join("kernels.air");
-    let metallib_path = dest.join("ds4_kernels.metallib");
-
-    let compile = Command::new("xcrun")
-        .args(["metal", "-O3", "-c"])
-        .arg(combined_path.to_str().unwrap())
-        .arg("-o")
-        .arg(air_path.to_str().unwrap())
-        .output();
-
-    match compile {
-        Ok(s) if s.status.success() => {
-            eprintln!("ds4-rs build: Metal kernel compiled to .air");
-            let link = Command::new("xcrun")
-                .args(["metallib", "-o"])
-                .arg(metallib_path.to_str().unwrap())
-                .arg(air_path.to_str().unwrap())
-                .output();
-            match link {
-                Ok(s) if s.status.success() => {
-                    eprintln!("ds4-rs build: Metal kernel metallib created");
-                }
-                Ok(s) => {
-                    eprintln!("ds4-rs build: metallib link failed: {}", 
-                        String::from_utf8_lossy(&s.stderr));
-                }
-                Err(e) => {
-                    eprintln!("ds4-rs build: metallib link error: {}", e);
-                }
-            }
-        }
+    // Compile to AIR
+    let air_path = Path::new(&out_dir).join("ds4_kernels.air");
+    let status = Command::new("xcrun")
+        .args(["-sdk", "macosx", "metal", "-std=metal3.0", "-O3"])
+        .arg("-o").arg(&air_path)
+        .arg("-c").arg(&src_path)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
         Ok(s) => {
-            eprintln!("ds4-rs build: Metal compilation failed (non-fatal, can use JIT):\n{}",
-                String::from_utf8_lossy(&s.stderr));
+            eprintln!("Metal compilation failed with exit code: {}", s);
+            eprintln!("Falling back to runtime compilation.");
+            return;
         }
         Err(e) => {
-            eprintln!("ds4-rs build: xcrun metal not available (non-fatal): {}", e);
+            eprintln!("Could not invoke Metal compiler: {}", e);
+            eprintln!("Falling back to runtime compilation.");
+            return;
+        }
+    }
+
+    // Link into metallib
+    let lib_path = Path::new(&out_dir).join("ds4_kernels.metallib");
+    let status = Command::new("xcrun")
+        .args(["-sdk", "macosx", "metallib"])
+        .arg("-o").arg(&lib_path)
+        .arg(&air_path)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            // Expose path so bridge.rs can load it at runtime
+            println!("cargo:rustc-env=DS4_METALLIB_PATH={}", lib_path.display());
+        }
+        Ok(s) => {
+            eprintln!("Metallib linking failed with exit code: {}", s);
+        }
+        Err(e) => {
+            eprintln!("Could not invoke metallib linker: {}", e);
         }
     }
 }
