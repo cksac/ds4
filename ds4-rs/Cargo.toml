@@ -7,9 +7,10 @@ edition = "2021"
 [dependencies]
 metal = "0.20"
 objc = "0.2"
+clap = { version = "4", features = ["derive"] }
 
 [build-dependencies]
 
 [[bin]]
-name = "ds4-server"
-path = "src/main.rs"
+name = "ds4f"
+path = "src/bin/ds4f.rs"

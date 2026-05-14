@@ -4,6 +4,9 @@ use crate::gguf::{GgufModel, N_VOCAB, N_LAYER};
 use crate::model_view::ModelViews;
 use crate::weights;
 use crate::tokenizer;
+use std::sync::Mutex;
+
+pub static SESSION: std::sync::OnceLock<Mutex<SessionState>> = std::sync::OnceLock::new();
 
 pub struct SessionState {
     pub graph: Option<GpuGraph>,

@@ -1704,97 +1704,14 @@ fn count_tokens(sess: &crate::session::SessionState, text: &str) -> usize {
 
 // ── HTTP Handlers ─────────────────────────────────────────────────────────
 
-fn handle_health(stream: &mut TcpStream) {
-    send_json(stream, 200, r#"{"status":"ok"}"#);
-}
-
 fn handle_models(stream: &mut TcpStream) {
-    send_json(stream, 200, r#"{"data":[{"id":"ds4-flash","object":"model"}]}"#);
+    let body = r#"{"object":"list","data":[{"id":"deepseek-v4-flash","object":"model","created":1767225600,"owned_by":"ds4.c","name":"DeepSeek V4 Flash","context_length":65536,"top_provider":{"context_length":65536,"max_completion_tokens":32768,"is_moderated":false},"supported_parameters":["tools","tool_choice","max_tokens","temperature","top_p","top_k","min_p","stop","seed","stream","reasoning_effort"]}]}"#;
+    send_json(stream, 200, body);
 }
 
-fn handle_tokenize(stream: &mut TcpStream, body: &str) {
-    let mut p = JsonParser::new(body);
-    p.ws();
-    if p.peek() == b'{' {
-        p.pos += 1;
-        loop {
-            p.ws();
-            if p.peek() == b'}' { break; }
-            let key = p.key().unwrap_or_default();
-            p.colon();
-            if key == "text" {
-                if let Some(text) = p.string() {
-                    if let Some(session) = crate::SESSION.get() {
-                        if let Ok(sess) = session.lock() {
-                            if let Some(ref vocab) = sess.vocab {
-                                let tokens = crate::tokenizer::bpe_tokenize(vocab, &text);
-                                let json = format!(r#"{{"tokens":{:?},"n_tokens":{}}}"#, tokens, tokens.len());
-                                send_json(stream, 200, &json);
-                                return;
-                            }
-                        }
-                    }
-                    send_error(stream, 400, "Tokenizer not loaded");
-                    return;
-                }
-            } else { p.skip_value(); }
-            p.comma();
-        }
-    }
-    send_error(stream, 400, "missing text");
-}
-
-fn handle_cache_save(stream: &mut TcpStream) {
-    if let Some(session) = crate::SESSION.get() {
-        if let Ok(sess) = session.lock() {
-            match sess.save_snapshot() {
-                Ok(data) => {
-                    let b64 = base64_encode(&data);
-                    let body = format!(r#"{{"snapshot":"{}","bytes":{}}}"#, b64, data.len());
-                    send_json(stream, 200, &body);
-                }
-                Err(e) => send_error(stream, 500, e),
-            }
-            return;
-        }
-    }
-    send_error(stream, 500, "no session");
-}
-
-fn handle_cache_load(stream: &mut TcpStream, body: &str) {
-    let mut p = JsonParser::new(body);
-    p.ws();
-    if p.peek() == b'{' {
-        p.pos += 1;
-        loop {
-            p.ws();
-            if p.peek() == b'}' { break; }
-            let key = p.key().unwrap_or_default();
-            p.colon();
-            if key == "snapshot" {
-                if let Some(b64) = p.string() {
-                    if let Some(session) = crate::SESSION.get() {
-                        if let Ok(mut sess) = session.lock() {
-                            match base64_decode(&b64) {
-                                Some(data) => {
-                                    match sess.load_snapshot(&data) {
-                                        Ok(_) => send_json(stream, 200, r#"{"status":"ok"}"#),
-                                        Err(e) => send_error(stream, 500, e),
-                                    }
-                                }
-                                None => send_error(stream, 400, "invalid base64"),
-                            }
-                            return;
-                        }
-                    }
-                    send_error(stream, 500, "no session");
-                    return;
-                }
-            } else { p.skip_value(); }
-            p.comma();
-        }
-    }
-    send_error(stream, 400, "missing snapshot");
+fn handle_model(stream: &mut TcpStream) {
+    let body = r#"{"id":"deepseek-v4-flash","object":"model","created":1767225600,"owned_by":"ds4.c","name":"DeepSeek V4 Flash","context_length":65536,"top_provider":{"context_length":65536,"max_completion_tokens":32768,"is_moderated":false},"supported_parameters":["tools","tool_choice","max_tokens","temperature","top_p","top_k","min_p","stop","seed","stream","reasoning_effort"]}"#;
+    send_json(stream, 200, body);
 }
 
 fn handle_chat(stream: &mut TcpStream, body: &str, is_anthropic: bool) {
@@ -1818,7 +1735,7 @@ fn handle_chat(stream: &mut TcpStream, body: &str, is_anthropic: bool) {
 }
 
 fn handle_chat_nonstream(stream: &mut TcpStream, r: Request, is_anthropic: bool) {
-    if let Some(session) = crate::SESSION.get() {
+    if let Some(session) = crate::session::SESSION.get() {
         if let Ok(mut sess) = session.lock() {
             let prompt_tokens = count_tokens(&sess, &r.prompt_text);
             let tokens = match sess.vocab.as_ref() {
@@ -1851,7 +1768,7 @@ fn handle_chat_nonstream(stream: &mut TcpStream, r: Request, is_anthropic: bool)
 }
 
 fn handle_chat_stream(stream: &mut TcpStream, r: Request, is_anthropic: bool) {
-    if let Some(session) = crate::SESSION.get() {
+    if let Some(session) = crate::session::SESSION.get() {
         if let Ok(mut sess) = session.lock() {
             let prompt_tokens = count_tokens(&sess, &r.prompt_text);
             let tokens = match sess.vocab.as_ref() {
@@ -2190,7 +2107,7 @@ fn handle_completions(stream: &mut TcpStream, body: &str) {
 }
 
 fn handle_completions_nonstream(stream: &mut TcpStream, r: Request) {
-    if let Some(session) = crate::SESSION.get() {
+    if let Some(session) = crate::session::SESSION.get() {
         if let Ok(mut sess) = session.lock() {
             let prompt_tokens = count_tokens(&sess, &r.prompt_text);
             let tokens = match sess.vocab.as_ref() {
@@ -2214,7 +2131,7 @@ fn handle_completions_nonstream(stream: &mut TcpStream, r: Request) {
 }
 
 fn handle_completions_stream(stream: &mut TcpStream, r: Request) {
-    if let Some(session) = crate::SESSION.get() {
+    if let Some(session) = crate::session::SESSION.get() {
         if let Ok(mut sess) = session.lock() {
             let tokens = match sess.vocab.as_ref() {
                 Some(v) => crate::tokenizer::bpe_tokenize(v, &r.prompt_text),
@@ -2302,18 +2219,12 @@ fn handle_client(mut stream: TcpStream) {
             }
             let (method, path) = (parts[0], parts[1]);
 
-            // Detect API style from path
-            let is_anthropic = path.starts_with("/v1/messages");
-
             match (method, path) {
-                ("GET", "/health") => handle_health(&mut stream),
                 ("GET", "/v1/models") => handle_models(&mut stream),
+                ("GET", "/v1/models/deepseek-v4-flash") => handle_model(&mut stream),
                 ("POST", "/v1/chat/completions") => handle_chat(&mut stream, body, false),
                 ("POST", "/v1/messages") => handle_chat(&mut stream, body, true),
                 ("POST", "/v1/completions") => handle_completions(&mut stream, body),
-                ("POST", "/v1/tokenize") => handle_tokenize(&mut stream, body),
-                ("GET", "/v1/cache/save") => handle_cache_save(&mut stream),
-                ("POST", "/v1/cache/load") => handle_cache_load(&mut stream, body),
                 _ => send_error(&mut stream, 404, "Not Found"),
             }
             return;
@@ -2324,54 +2235,6 @@ fn handle_client(mut stream: TcpStream) {
             return;
         }
     }
-}
-
-// ── Base64 ────────────────────────────────────────────────────────────────
-
-fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(CHARS[((triple >> 18) & 0x3f) as usize] as char);
-        out.push(CHARS[((triple >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 { CHARS[((triple >> 6) & 0x3f) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { CHARS[(triple & 0x3f) as usize] as char } else { '=' });
-    }
-    out
-}
-
-fn base64_decode(data: &str) -> Option<Vec<u8>> {
-    const DECODE: [i8; 128] = {
-        let mut table = [-1i8; 128];
-        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut i = 0;
-        while i < 64 {
-            table[chars[i] as usize] = i as i8;
-            i += 1;
-        }
-        table
-    };
-    let bytes = data.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    let mut i = 0;
-    while i + 4 <= bytes.len() {
-        let mut vals = [0u8; 4];
-        for j in 0..4 {
-            let c = bytes[i + j];
-            if c == b'=' { vals[j] = 0; }
-            else if c as usize >= 128 { return None; }
-            else { vals[j] = DECODE[c as usize] as u8; }
-        }
-        out.push((vals[0] << 2) | (vals[1] >> 4));
-        if bytes[i + 2] != b'=' { out.push((vals[1] << 4) | (vals[2] >> 2)); }
-        if bytes[i + 3] != b'=' { out.push((vals[2] << 6) | vals[3]); }
-        i += 4;
-    }
-    Some(out)
 }
 
 // ── Public Entry Point ────────────────────────────────────────────────────
