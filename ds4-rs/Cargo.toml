@@ -1,0 +1,15 @@
+[package]
+name = "ds4-rs"
+version = "0.1.0"
+description = "DS4 inference engine Rust port with Metal GPU backend and HTTP server"
+edition = "2021"
+
+[dependencies]
+metal = "0.20"
+objc = "0.2"
+
+[build-dependencies]
+
+[[bin]]
+name = "ds4-server"
+path = "src/main.rs"
