@@ -1,13 +1,36 @@
-use metal::*;
-use std::cell::RefCell;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCreateSystemDefaultDevice, MTLCompileOptions, MTLDevice,
+    MTLCommandQueue, MTLLibrary, MTLResourceOptions,
+};
+use objc2_foundation::{NSString, NSURL};
 use std::sync::Mutex;
 
-static INITIALIZED: Mutex<bool> = Mutex::new(false);
+// MTLDevice, MTLCommandQueue, MTLLibrary are documented as thread-safe.
+// objc2-metal does not impl Send for ProtocolObject<dyn MTL*>, so we wrap.
+struct SendRetained<T: ?Sized>(Retained<ProtocolObject<T>>);
+unsafe impl<T: ?Sized> Send for SendRetained<T> {}
 
-thread_local! {
-    pub static DEVICE: RefCell<Option<Device>> = RefCell::new(None);
-    pub static QUEUE: RefCell<Option<CommandQueue>> = RefCell::new(None);
-    pub static LIBRARY: RefCell<Option<Library>> = RefCell::new(None);
+static INITIALIZED: Mutex<bool> = Mutex::new(false);
+static DEVICE:  Mutex<Option<SendRetained<dyn MTLDevice>>>      = Mutex::new(None);
+static QUEUE:   Mutex<Option<SendRetained<dyn MTLCommandQueue>>> = Mutex::new(None);
+static LIBRARY: Mutex<Option<SendRetained<dyn MTLLibrary>>>      = Mutex::new(None);
+
+pub fn device() -> Option<Retained<ProtocolObject<dyn MTLDevice>>> {
+    DEVICE.lock().unwrap().as_ref().map(|s| s.0.clone())
+}
+pub fn queue() -> Option<Retained<ProtocolObject<dyn MTLCommandQueue>>> {
+    QUEUE.lock().unwrap().as_ref().map(|s| s.0.clone())
+}
+pub fn library() -> Option<Retained<ProtocolObject<dyn MTLLibrary>>> {
+    LIBRARY.lock().unwrap().as_ref().map(|s| s.0.clone())
+}
+
+pub fn device_name() -> String {
+    DEVICE.lock().unwrap().as_ref()
+        .map(|s| s.0.name().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn build_metal_source() -> String {
@@ -22,7 +45,6 @@ fn build_metal_source() -> String {
     source.push_str("#define FOR_UNROLL(x) _Pragma(\"clang loop unroll(full)\") for (x)\n");
     source.push_str("struct block_q8_0 { half d; int8_t qs[QK8_0]; };\n");
     source.push_str("enum ds4_sort_order { DS4_SORT_ORDER_ASC, DS4_SORT_ORDER_DESC };\n\n");
-    // Missing dequantize_f16_t4 needed by dense.metal template instantiations
     source.push_str("static void dequantize_f16_t4(device const half4 * src, short il, thread float4 & reg) {\n");
     source.push_str("    reg = (float4)(*src);\n}\n\n");
 
@@ -46,12 +68,10 @@ pub fn init() -> Result<(), Box<dyn std::error::Error>> {
     let mut init = INITIALIZED.lock().unwrap();
     if *init { return Ok(()); }
 
-    let device = Device::system_default().ok_or("no Metal device")?;
-    let queue = device.new_command_queue();
+    let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
+    let queue = device.newCommandQueue().ok_or("no command queue")?;
 
-    let library: Library;
-
-    // Try precompiled metallib first (via build.rs), fall back to source compilation
+    // Try precompiled metallib first, fall back to source compilation
     let metallib_env = option_env!("DS4_METALLIB_PATH");
     let precompiled = metallib_env
         .and_then(|p| if std::path::Path::new(p).exists() { Some(p.to_string()) } else { None })
@@ -60,19 +80,25 @@ pub fn init() -> Result<(), Box<dyn std::error::Error>> {
                 std::path::Path::new(&d).join("ds4_kernels.metallib").to_string_lossy().to_string()
             }).filter(|p| std::path::Path::new(p).exists())
         });
-    if let Some(ref path) = precompiled {
+
+    let library = if let Some(ref path) = precompiled {
         eprintln!("ds4: loading precompiled Metal library from {}", path);
-        library = device.new_library_with_file(std::path::Path::new(path))?;
+        let url = NSURL::from_file_path(std::path::Path::new(path))
+            .ok_or("bad metallib path")?;
+        device.newLibraryWithURL_error(&url)
+            .map_err(|e| format!("metallib load error: {}", e))?
     } else {
         eprintln!("ds4: compiling Metal library from source");
-        let source = build_metal_source();
-        let opts = CompileOptions::new();
-        library = device.new_library_with_source(&source, &opts)?;
-    }
+        let source_str = build_metal_source();
+        let ns_source = NSString::from_str(&source_str);
+        let opts = MTLCompileOptions::new();
+        device.newLibraryWithSource_options_error(&ns_source, Some(&opts))
+            .map_err(|e| format!("Metal compile error: {}", e))?
+    };
 
-    DEVICE.with(|d| *d.borrow_mut() = Some(device));
-    QUEUE.with(|q| *q.borrow_mut() = Some(queue));
-    LIBRARY.with(|l| *l.borrow_mut() = Some(library));
+    *DEVICE.lock().unwrap()  = Some(SendRetained(device));
+    *QUEUE.lock().unwrap()   = Some(SendRetained(queue));
+    *LIBRARY.lock().unwrap() = Some(SendRetained(library));
 
     *init = true;
     crate::pipeline::init_cache();
@@ -82,20 +108,8 @@ pub fn init() -> Result<(), Box<dyn std::error::Error>> {
 pub fn cleanup() {
     let mut init = INITIALIZED.lock().unwrap();
     if !*init { return; }
-    DEVICE.with(|d| *d.borrow_mut() = None);
-    QUEUE.with(|q| *q.borrow_mut() = None);
-    LIBRARY.with(|l| *l.borrow_mut() = None);
+    *DEVICE.lock().unwrap()  = None;
+    *QUEUE.lock().unwrap()   = None;
+    *LIBRARY.lock().unwrap() = None;
     *init = false;
-}
-
-pub fn with_device<F: FnOnce(&Device) -> R, R>(f: F) -> Option<R> {
-    DEVICE.with(|d| d.borrow().as_ref().map(|dev| f(dev)))
-}
-
-pub fn with_queue<F: FnOnce(&CommandQueue) -> R, R>(f: F) -> Option<R> {
-    QUEUE.with(|q| q.borrow().as_ref().map(|q| f(q)))
-}
-
-pub fn with_library<F: FnOnce(&Library) -> R, R>(f: F) -> Option<R> {
-    LIBRARY.with(|l| l.borrow().as_ref().map(|lib| f(lib)))
 }

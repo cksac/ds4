@@ -5,17 +5,13 @@ use crate::tensor::GpuTensor;
 use crate::gguf::N_HEAD_DIM;
 use crate::metal_args;
 use std::ffi::c_void;
-use std::time::{Duration, Instant};
 
 fn wait_gpu(cb: &CommandBufferRef) -> Result<(), &'static str> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match cb.status() {
-            MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Scheduled => {}
-            _ => return Ok(()),
-        }
-        if Instant::now() >= deadline { return Err("gpu timeout"); }
-        std::thread::sleep(Duration::from_millis(10));
+    cb.wait_until_completed();
+    if cb.status() == MTLCommandBufferStatus::Error {
+        Err("gpu kernel failed")
+    } else {
+        Ok(())
     }
 }
 

@@ -5,8 +5,28 @@ description = "DS4 inference engine Rust port with Metal GPU backend and HTTP se
 edition = "2021"
 
 [dependencies]
-metal = "0.20"
-objc = "0.2"
+objc2-metal = { version = "0.3.2", features = [
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLDataType",
+    "MTLDevice",
+    "MTLFunctionConstantValues",
+    "MTLLibrary",
+    "MTLResource",
+    "block2",
+] }
+objc2-foundation = { version = "0.3.2", features = [
+    "NSString",
+    "NSURL",
+    "NSError",
+] }
+objc2 = "0.6"
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 memmap2 = "0.9"
 

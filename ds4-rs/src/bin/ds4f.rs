@@ -123,18 +123,41 @@ fn init_metal() {
         eprintln!("  Try setting DS4_NO_GPU=1 for CPU mode.");
         std::process::exit(1);
     }
+    let ram_gib = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|b| b as f64 / (1024.0 * 1024.0 * 1024.0))
+        .unwrap_or(0.0);
+    ds4_rs::bridge::with_device(|d| {
+        eprintln!("ds4: Metal device {}, {:.2} GiB RAM", d.name(), ram_gib);
+    });
 }
 
 fn load_model(model_path: &str, ctx_size: u32, quiet: bool) -> ds4_rs::session::SessionState {
-    if !quiet { eprintln!("Loading model: {}", model_path); }
+    if !quiet { eprintln!("ds4: loading model: {}", model_path); }
     if Path::new(model_path).exists() {
+        let t0 = std::time::Instant::now();
         match ds4_rs::gguf::GgufModel::open(Path::new(model_path)) {
             Ok(model) => {
+                let t_map_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let size_mib = model.size as f64 / (1024.0 * 1024.0);
+                let offset_mib = model.tensor_data_pos as f64 / (1024.0 * 1024.0);
                 if !quiet {
-                    eprintln!("  tensors={} kv={}", model.n_tensors, model.n_kv);
+                    eprintln!("ds4: model views created in {:.3} ms (mapped {:.2} MiB from offset {:.2} MiB, tensors={} kv={})",
+                        t_map_ms, size_mib, offset_mib, model.n_tensors, model.n_kv);
                 }
                 match ds4_rs::session::SessionState::from_model(&model) {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        if !quiet {
+                            eprintln!("ds4: context buffers (ctx={}, backend=metal, prefill_chunk={}, raw_kv_rows={}, compressed_kv_rows={})",
+                                ctx_size, s.prefill_cap, s.raw_cap, s.comp_cap);
+                            eprintln!("ds4: metal backend initialized");
+                        }
+                        s
+                    }
                     Err(e) => {
                         eprintln!("WARN: Session init: {} (stub mode)", e);
                         ds4_rs::session::SessionState::new(ctx_size)
@@ -159,8 +182,6 @@ fn cmd_run(opts: RunArgs) {
 
     init_metal();
     let session = load_model(&opts.model, opts.ctx_size, false);
-
-    let _ = ds4_rs::session::SESSION.set(Mutex::new(load_model(&opts.model, opts.ctx_size, true)));
 
     if opts.inspect {
         eprintln!("Model: {}", opts.model);
@@ -195,26 +216,46 @@ fn run_one_shot(mut sess: ds4_rs::session::SessionState, opts: &RunArgs, prompt:
         Some(vocab) => ds4_rs::tokenizer::bpe_tokenize(vocab, &rendered),
         None => { eprintln!("No vocab loaded."); std::process::exit(1); }
     };
+    let n_prompt = tokens.len();
 
-    let start = std::time::Instant::now();
-    let result_tokens = if opts.temperature < 0.01 {
-        sess.generate(&tokens, opts.n_predict)
-    } else {
-        sess.generate_with_stops(&tokens, opts.n_predict, &[], opts.temperature, opts.top_k)
-    };
-    let elapsed = start.elapsed();
+    // Time prefill separately
+    let t_prefill_start = std::time::Instant::now();
+    eprintln!("ds4: prefilling {} tokens...", n_prompt);
+    if let Err(e) = sess.prefill(&tokens) {
+        eprintln!("Prefill error: {}", e);
+        std::process::exit(1);
+    }
+    let t_prefill = t_prefill_start.elapsed();
+    eprintln!("ds4: prefill done in {:.3}s", t_prefill.as_secs_f64());
 
-    let text = match sess.vocab.as_ref() {
-        Some(vocab) => ds4_rs::tokenizer::token_decode(vocab, &result_tokens),
-        None => String::new(),
-    };
-    print_formatted(&text);
+    // Time generation separately, stream tokens as they are produced
+    let t_gen_start = std::time::Instant::now();
+    let mut result_tokens = Vec::new();
+    for _ in 0..opts.n_predict {
+        let token = if opts.temperature < 0.01 {
+            sess.argmax().0
+        } else {
+            sess.sample(opts.temperature, opts.top_k)
+        };
+        if sess.is_stop_token(token) { break; }
+        result_tokens.push(token);
+        if let Some(ref vocab) = sess.vocab {
+            let txt = ds4_rs::tokenizer::token_decode(vocab, &[token]);
+            print!("{}", txt);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        if let Err(e) = sess.decode(token) {
+            eprintln!("\nDecode error: {}", e);
+            break;
+        }
+    }
+    let t_gen = t_gen_start.elapsed();
     println!();
 
-    let n = result_tokens.len();
-    if n > 0 {
-        eprintln!("\nGenerated {} tokens in {:.1}s ({:.1} t/s)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
-    }
+    let n_gen = result_tokens.len();
+    let prefill_tps = if t_prefill.as_secs_f64() > 0.0 { n_prompt as f64 / t_prefill.as_secs_f64() } else { 0.0 };
+    let gen_tps = if t_gen.as_secs_f64() > 0.0 { n_gen as f64 / t_gen.as_secs_f64() } else { 0.0 };
+    eprintln!("ds4: prefill: {:.2} t/s, generation: {:.2} t/s", prefill_tps, gen_tps);
 }
 
 // ── Interactive REPL ──────────────────────────────────────────────────────
@@ -321,14 +362,16 @@ fn do_chat_turn(
         Some(v) => ds4_rs::tokenizer::bpe_tokenize(v, &prompt_text),
         None => { eprintln!("No vocab."); return; }
     };
+    let n_prompt = tokens.len();
 
-    let start = std::time::Instant::now();
-
+    let t_prefill_start = std::time::Instant::now();
     if let Err(e) = sess.prefill(&tokens) {
         eprintln!("Prefill error: {}", e);
         return;
     }
+    let t_prefill = t_prefill_start.elapsed();
 
+    let t_gen_start = std::time::Instant::now();
     let mut out = Vec::new();
     for _ in 0..max_tokens {
         let token = if temperature < 0.01 { sess.argmax().0 } else { sess.sample(temperature, top_k) };
@@ -346,17 +389,17 @@ fn do_chat_turn(
             break;
         }
     }
+    let t_gen = t_gen_start.elapsed();
 
-    let elapsed = start.elapsed();
     let text = sess.vocab.as_ref()
         .map(|v| ds4_rs::tokenizer::token_decode(v, &out))
         .unwrap_or_default();
     transcript.push(("assistant".to_string(), text));
 
-    let n = out.len();
-    if n > 0 {
-        eprintln!("\n[{} tokens, {:.1}t/s]", n, n as f64 / elapsed.as_secs_f64());
-    } else { eprintln!(); }
+    let n_gen = out.len();
+    let prefill_tps = if t_prefill.as_secs_f64() > 0.0 { n_prompt as f64 / t_prefill.as_secs_f64() } else { 0.0 };
+    let gen_tps = if t_gen.as_secs_f64() > 0.0 { n_gen as f64 / t_gen.as_secs_f64() } else { 0.0 };
+    eprintln!("\nds4: prefill: {:.2} t/s, generation: {:.2} t/s", prefill_tps, gen_tps);
 }
 
 fn render_prompt(prompt: &str, system: &str, think: bool) -> String {
@@ -367,23 +410,6 @@ fn render_prompt(prompt: &str, system: &str, think: bool) -> String {
     out.push_str("<｜Assistant｜>");
     out.push_str(if think { "<think>" } else { "</think>" });
     out
-}
-
-fn print_formatted(text: &str) {
-    let mut pos = 0;
-    while pos < text.len() {
-        if let Some(ts) = text[pos..].find("<think>") {
-            print!("{}", &text[pos..pos + ts]);
-            pos += ts + 7;
-            if let Some(te) = text[pos..].find("</think>") {
-                print!("{}", &text[pos..pos + te]);
-                pos += te + 8;
-            }
-        } else {
-            print!("{}", &text[pos..]);
-            break;
-        }
-    }
 }
 
 // ── `ds4f serve` ──────────────────────────────────────────────────────────
