@@ -4,7 +4,8 @@ use crate::gguf::{GgufModel, N_VOCAB, N_LAYER};
 use crate::model_view::ModelViews;
 use crate::weights;
 use crate::tokenizer;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use memmap2::Mmap;
 
 pub static SESSION: std::sync::OnceLock<Mutex<SessionState>> = std::sync::OnceLock::new();
 
@@ -17,7 +18,7 @@ pub struct SessionState {
     pub model_views: Option<ModelViews>,
     pub weights: Option<EngineWeights>,
     pub vocab: Option<Vocab>,
-    pub model_map: Option<Vec<u8>>,
+    pub model_map: Option<Arc<Mmap>>,
     pub model_size: u64,
     pub stop_tokens: Vec<i32>,
 }
@@ -47,7 +48,7 @@ impl SessionState {
             prefill_cap: 2048, raw_cap: rc, comp_cap: cc,
             model_views: Some(views), weights: Some(w),
             vocab: Some(tokenizer::vocab_load(model)),
-            model_map: Some(model.map.clone()),
+            model_map: Some(model.map.clone()), // Arc::clone, cheap
             model_size: model.size,
             stop_tokens: vec![2],
         })

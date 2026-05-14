@@ -2,6 +2,8 @@ use std::path::Path;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
+use memmap2::Mmap;
 
 pub const N_LAYER: u32 = 43;
 pub const N_EMBD: u32 = 4096;
@@ -156,7 +158,7 @@ impl GgufTensor {
 }
 
 pub struct GgufModel {
-    pub map: Vec<u8>,
+    pub map: Arc<Mmap>,
     pub file: File,
     pub fd: i32,
     pub size: u64,
@@ -255,11 +257,9 @@ impl GgufModel {
 
         let tensor_data_pos = file.stream_position()?;
 
-        // Map entire file for weight data access
-        file.seek(SeekFrom::Start(0))?;
-        let mut map = Vec::with_capacity(size as usize);
-        map.resize(size as usize, 0);
-        file.read_exact(&mut map)?;
+        // Memory-map the file for lazy weight data access
+        let mmap = unsafe { Mmap::map(&file)? };
+        let map = Arc::new(mmap);
 
         // Align tensor data start
         let aligned_pos = ((tensor_data_pos + alignment - 1) / alignment) * alignment;

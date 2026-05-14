@@ -8,6 +8,7 @@ edition = "2021"
 metal = "0.20"
 objc = "0.2"
 clap = { version = "4", features = ["derive"] }
+memmap2 = "0.9"
 
 [build-dependencies]
 
