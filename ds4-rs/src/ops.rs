@@ -15,8 +15,6 @@ use crate::model_view::ModelViews;
 use crate::gguf::N_HEAD_DIM;
 use crate::metal_args;
 
-// ─── GPU wait ───────────────────────────────────────────────────────────────
-
 fn wait_gpu(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<(), &'static str> {
     cb.waitUntilCompleted();
     if cb.status() == objc2_metal::MTLCommandBufferStatus::Error {
@@ -26,12 +24,10 @@ fn wait_gpu(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<(), &'static st
     }
 }
 
-// ─── Function-constant indices ───────────────────────────────────────────────
-
 const FC_MUL_MV: usize = 600;
-const FC_FLASH_ATTN_EXT: usize = 300;
-
-// ─── Pipeline helpers ────────────────────────────────────────────────────────
+const FC_BIN: usize = 1300;
+const FC_UNARY: usize = 1200;
+const FC_SUM_ROWS: usize = 1400;
 
 fn get_or_create_pipeline(name: &str)
     -> Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>
@@ -71,6 +67,60 @@ fn make_matmul_pipeline(name: &str, nsg: i16, nxpsg: i16)
     Some(p)
 }
 
+fn make_bin_pipeline(op: i16, f: i16, rb: bool, cb: bool)
+    -> Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>
+{
+    let key = format!("kernel_bin_fuse_f32_f32_f32_{}_{}_{}_{}", op, f, rb, cb);
+    if let Some(p) = pipeline::get_pipeline(&key) { return Some(p); }
+    let lib = bridge::library()?;
+    let fcv = MTLFunctionConstantValues::new();
+    let mut op_v = op; let mut f_v = f; let mut rb_v = rb as u8; let mut cb_v = cb as u8;
+    unsafe {
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut op_v as *mut i16 as *mut c_void).unwrap(),
+            MTLDataType::Short, FC_BIN + 0);
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut f_v as *mut i16 as *mut c_void).unwrap(),
+            MTLDataType::Short, FC_BIN + 1);
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut rb_v as *mut u8 as *mut c_void).unwrap(),
+            MTLDataType::Bool, FC_BIN + 2);
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut cb_v as *mut u8 as *mut c_void).unwrap(),
+            MTLDataType::Bool, FC_BIN + 3);
+    }
+    let ns_name = NSString::from_str("kernel_bin_fuse_f32_f32_f32");
+    let fn_ = lib.newFunctionWithName_constantValues_error(&*ns_name, &*fcv).ok()?;
+    let device = bridge::device()?;
+    let p = device.newComputePipelineStateWithFunction_error(&*fn_).ok()?;
+    pipeline::cache_pipeline(&key, p.clone());
+    Some(p)
+}
+
+fn make_unary_pipeline(op: i16)
+    -> Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>
+{
+    let key = format!("kernel_unary_f32_f32_4_{}", op);
+    if let Some(p) = pipeline::get_pipeline(&key) { return Some(p); }
+    let lib = bridge::library()?;
+    let fcv = MTLFunctionConstantValues::new();
+    let mut op_v = op; let mut cnt_v: u8 = 0;
+    unsafe {
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut op_v as *mut i16 as *mut c_void).unwrap(),
+            MTLDataType::Short, FC_UNARY + 0);
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut cnt_v as *mut u8 as *mut c_void).unwrap(),
+            MTLDataType::Bool, FC_UNARY + 1);
+    }
+    let ns_name = NSString::from_str("kernel_unary_f32_f32_4");
+    let fn_ = lib.newFunctionWithName_constantValues_error(&*ns_name, &*fcv).ok()?;
+    let device = bridge::device()?;
+    let p = device.newComputePipelineStateWithFunction_error(&*fn_).ok()?;
+    pipeline::cache_pipeline(&key, p.clone());
+    Some(p)
+}
+
 fn make_attn_prefill_pipeline(name: &str, nsg: i32)
     -> Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>
 {
@@ -85,17 +135,17 @@ fn make_attn_prefill_pipeline(name: &str, nsg: i32)
         for i in 0..5usize {
             fcv.setConstantValue_type_atIndex(
                 NonNull::new(&mut f_false as *mut u8 as *mut c_void).unwrap(),
-                MTLDataType::Bool, FC_FLASH_ATTN_EXT + i);
+                MTLDataType::Bool, 300 + i);
         }
         fcv.setConstantValue_type_atIndex(
             NonNull::new(&mut nsg_v as *mut i32 as *mut c_void).unwrap(),
-            MTLDataType::Int, FC_FLASH_ATTN_EXT + 22);
+            MTLDataType::Int, 300 + 22);
         fcv.setConstantValue_type_atIndex(
             NonNull::new(&mut zero_v as *mut i32 as *mut c_void).unwrap(),
-            MTLDataType::Int, FC_FLASH_ATTN_EXT + 20);
+            MTLDataType::Int, 300 + 20);
         fcv.setConstantValue_type_atIndex(
             NonNull::new(&mut zero_v as *mut i32 as *mut c_void).unwrap(),
-            MTLDataType::Int, FC_FLASH_ATTN_EXT + 21);
+            MTLDataType::Int, 300 + 21);
     }
     let ns_name = NSString::from_str(name);
     let fn_ = lib.newFunctionWithName_constantValues_error(&*ns_name, &*fcv).ok()?;
@@ -105,15 +155,13 @@ fn make_attn_prefill_pipeline(name: &str, nsg: i32)
     Some(p)
 }
 
-// ─── Core dispatch ───────────────────────────────────────────────────────────
-
-/// Dispatch: args struct at buffer-slot 0; data buffers at slots 1..N.
-fn dispatch_with_args<T: Sized>(
+fn dispatch_with_args_tg<T: Sized>(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     args: &T,
     buffers: &[(Option<&ProtocolObject<dyn MTLBuffer>>, u64)],
     threads: (usize, usize, usize),
     tg_size: (usize, usize, usize),
+    tg_mem: u64,
 ) -> Result<(), &'static str> {
     let queue  = bridge::queue().ok_or("no queue")?;
     let device = bridge::device().ok_or("no device")?;
@@ -135,6 +183,9 @@ fn dispatch_with_args<T: Sized>(
             unsafe { enc.setBuffer_offset_atIndex(Some(*b), *off as usize, i + 1); }
         }
     }
+    if tg_mem > 0 {
+        unsafe { enc.setThreadgroupMemoryLength_atIndex(tg_mem as usize, 0); }
+    }
     enc.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize { width: threads.0, height: threads.1, depth: threads.2 },
         MTLSize { width: tg_size.0, height: tg_size.1, depth: tg_size.2 },
@@ -144,7 +195,36 @@ fn dispatch_with_args<T: Sized>(
     wait_gpu(&*cb)
 }
 
-/// Dispatch without args struct; buffers at slots 0..N-1.
+fn dispatch_with_args<T: Sized>(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    args: &T,
+    buffers: &[(Option<&ProtocolObject<dyn MTLBuffer>>, u64)],
+    threads: (usize, usize, usize),
+    tg_size: (usize, usize, usize),
+) -> Result<(), &'static str> {
+    dispatch_with_args_tg(pipeline, args, buffers, threads, tg_size, 0)
+}
+
+fn dispatch_pipeline_tg<T: Sized>(
+    pipeline_name: &str, args: &T,
+    buffers: &[(Option<&ProtocolObject<dyn MTLBuffer>>, u64)],
+    threads: (usize, usize, usize),
+    tg_size: (usize, usize, usize),
+    tg_mem: u64,
+) -> Result<(), &'static str> {
+    let p = get_or_create_pipeline(pipeline_name).ok_or("pipeline not found")?;
+    dispatch_with_args_tg(&*p, args, buffers, threads, tg_size, tg_mem)
+}
+
+fn dispatch_pipeline<T: Sized>(
+    pipeline_name: &str, args: &T,
+    buffers: &[(Option<&ProtocolObject<dyn MTLBuffer>>, u64)],
+    threads: (usize, usize, usize),
+    tg_size: (usize, usize, usize),
+) -> Result<(), &'static str> {
+    dispatch_pipeline_tg(pipeline_name, args, buffers, threads, tg_size, 0)
+}
+
 fn dispatch_raw(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     buffers: &[(Option<&ProtocolObject<dyn MTLBuffer>>, u64)],
@@ -155,7 +235,6 @@ fn dispatch_raw(
     let cb  = queue.commandBuffer().ok_or("no command buffer")?;
     let enc = cb.computeCommandEncoder().ok_or("no encoder")?;
     enc.setComputePipelineState(pipeline);
-
     for (i, (buf, off)) in buffers.iter().enumerate() {
         if let Some(b) = buf {
             unsafe { enc.setBuffer_offset_atIndex(Some(*b), *off as usize, i); }
@@ -170,17 +249,13 @@ fn dispatch_raw(
     wait_gpu(&*cb)
 }
 
-fn dispatch_pipeline<T: Sized>(
-    pipeline_name: &str, args: &T,
-    buffers: &[(Option<&ProtocolObject<dyn MTLBuffer>>, u64)],
-    threads: (usize, usize, usize),
-    tg_size: (usize, usize, usize),
-) -> Result<(), &'static str> {
-    let p = get_or_create_pipeline(pipeline_name).ok_or("pipeline not found")?;
-    dispatch_with_args(&*p, args, buffers, threads, tg_size)
+fn rms_norm_threads(n: u32) -> u32 {
+    let mut nth = 32u32;
+    let ne00_t = n / 4;
+    while nth < ne00_t && nth < 1024 { nth <<= 1; }
+    if nth > ne00_t { nth = ne00_t; }
+    nth.max(1)
 }
-
-// ─── Arg structs ─────────────────────────────────────────────────────────────
 
 #[repr(C)]
 struct MulMvArgs {
@@ -342,30 +417,94 @@ struct RepeatArgs {
     nb0: u64, nb1: u64, nb2: u64, nb3: u64,
 }
 
-// ─── RMS Norm ────────────────────────────────────────────────────────────────
+#[repr(C)]
+struct SumRowsArgs {
+    ne00: i64, ne01: i64, ne02: i64, ne03: i64,
+    nb00: u64, nb01: u64, nb02: u64, nb03: u64,
+    ne0: i64, ne1: i64, ne2: i64, ne3: i64,
+    nb0: u64, nb1: u64, nb2: u64, nb3: u64,
+}
+
+// ─── RMS Norm ───────────────────────────────────────────────────────────
 
 pub fn rms_norm_plain(
     out: &GpuTensor, x: &GpuTensor, n: u32, eps: f32,
 ) -> Result<(), &'static str> {
+    rms_norm_plain_rows(out, x, n, 1, eps)
+}
+
+pub fn rms_norm_plain_rows(
+    out: &GpuTensor, x: &GpuTensor, n: u32, rows: u32, eps: f32,
+) -> Result<(), &'static str> {
     let n4 = (n / 4) as i32;
     let row_bytes = (n * 4) as u64;
+    let plane_bytes = row_bytes * rows as u64;
+    let args = RmsNormArgs {
+        ne00: n as i32, ne00_t: n4,
+        nb1: row_bytes, nb2: plane_bytes, nb3: plane_bytes, eps,
+        nef1: [rows as i32, 1, 1], nef2: [1, 1, 1], nef3: [1, 1, 1],
+        nbf1: [row_bytes, 0, 0], nbf2: [0; 3], nbf3: [0; 3],
+    };
+    let nth = rms_norm_threads(n) as usize;
+    dispatch_pipeline_tg("kernel_rms_norm_f32_4", &args,
+        &[(x.buf_ref(), x.offset_raw()),
+          (x.buf_ref(), x.offset_raw()),
+          (x.buf_ref(), x.offset_raw()),
+          (out.buf_ref(), out.offset_raw())],
+        (rows as usize, 1, 1), (nth, 1, 1), 128)
+}
+
+pub fn rms_norm_weight(
+    out: &GpuTensor, x: &GpuTensor,
+    views: &ModelViews, weight_offset: u64,
+    n: u32, eps: f32,
+) -> Result<(), &'static str> {
+    let row_bytes = (n * 4) as u64;
+    let (wbuf, woff) = views.find_view(weight_offset, row_bytes)
+        .ok_or("rms_norm weight view")?;
+    let n4 = (n / 4) as i32;
     let args = RmsNormArgs {
         ne00: n as i32, ne00_t: n4,
         nb1: row_bytes, nb2: row_bytes, nb3: row_bytes, eps,
-        nef1: [n4, 0, 0], nef2: [0; 3], nef3: [0; 3],
+        nef1: [1, 1, 1], nef2: [1, 1, 1], nef3: [1, 1, 1],
         nbf1: [row_bytes, 0, 0], nbf2: [0; 3], nbf3: [0; 3],
     };
-    dispatch_pipeline("kernel_rms_norm_f32_4", &args,
-        &[(x.buf_ref(), x.offset_raw()), (None, 0), (None, 0),
+    let nth = rms_norm_threads(n) as usize;
+    dispatch_pipeline_tg("kernel_rms_norm_mul_f32_4", &args,
+        &[(x.buf_ref(), x.offset_raw()),
+          (Some(wbuf), woff),
+          (x.buf_ref(), x.offset_raw()),
           (out.buf_ref(), out.offset_raw())],
-        (1, 1, 1), (256, 1, 1))
+        (1, 1, 1), (nth, 1, 1), 128)
 }
 
-// ─── RoPE ────────────────────────────────────────────────────────────────────
+pub fn head_rms_norm(
+    x: &GpuTensor, n_tok: u32, n_head: u32, head_dim: u32, eps: f32,
+) -> Result<(), &'static str> {
+    let n4 = (head_dim / 4) as i32;
+    let row_bytes = (head_dim * 4) as u64;
+    let head_bytes = row_bytes * n_head as u64;
+    let plane_bytes = head_bytes * n_tok as u64;
+    let args = RmsNormArgs {
+        ne00: head_dim as i32, ne00_t: n4,
+        nb1: row_bytes, nb2: head_bytes, nb3: plane_bytes, eps,
+        nef1: [n_head as i32, 1, 1], nef2: [n_tok as i32, 1, 1], nef3: [1, 1, 1],
+        nbf1: [row_bytes, 0, 0], nbf2: [head_bytes, 0, 0], nbf3: [plane_bytes, 0, 0],
+    };
+    let nth = rms_norm_threads(head_dim) as usize;
+    dispatch_pipeline_tg("kernel_rms_norm_f32_4", &args,
+        &[(x.buf_ref(), x.offset_raw()),
+          (x.buf_ref(), x.offset_raw()),
+          (x.buf_ref(), x.offset_raw()),
+          (x.buf_ref(), x.offset_raw())],
+        (n_head as usize, n_tok as usize, 1), (nth, 1, 1), 128)
+}
+
+// ─── RoPE ───────────────────────────────────────────────────────────────
 
 pub fn rope_tail(
     x: &GpuTensor, _n_tok: u32, n_head: u32, head_dim: u32,
-    n_rot: u32, pos: u32, n_ctx_orig: u32, _inverse: bool,
+    n_rot: u32, pos: u32, n_ctx_orig: u32, inverse: bool,
     freq_base: f32, freq_scale: f32, ext_factor: f32,
     attn_factor: f32, beta_fast: f32, beta_slow: f32,
 ) -> Result<(), &'static str> {
@@ -375,7 +514,7 @@ pub fn rope_tail(
         nb00: 4, nb01: stride, nb02: stride, nb03: stride,
         nb0: 4, nb1: stride, nb2: stride, nb3: stride,
         n_dims: n_rot as i32, mode: 2, n_ctx_orig: n_ctx_orig as i32,
-        inverse: 0, freq_base, freq_scale, ext_factor, attn_factor,
+        inverse: inverse as i32, freq_base, freq_scale, ext_factor, attn_factor,
         beta_fast, beta_slow, src2: 0, _padding: [0; 7],
     };
     let device = bridge::device().ok_or("no device")?;
@@ -393,73 +532,278 @@ pub fn rope_tail(
         (std::cmp::min(256usize, head_dim as usize).max(1), 1, 1))
 }
 
-// ─── HC Split Sinkhorn ───────────────────────────────────────────────────────
+// ─── HC Split Sinkhorn ──────────────────────────────────────────────────
 
 pub fn hc_split_sinkhorn(
     out: &GpuTensor, mixes: &GpuTensor,
+    views: &ModelViews,
+    scale_offset: u64, base_offset: u64,
     n_hc: u32, sinkhorn_iters: u32, eps: f32,
 ) -> Result<(), &'static str> {
+    let mix_hc = (2 * n_hc + n_hc * n_hc) as u64;
+    let mix_bytes = mix_hc * 4;
+    let scale_bytes = 3 * 4;
+    let (scale_buf, scale_inner) = views.find_view(scale_offset, scale_bytes)
+        .ok_or("hc_split_sinkhorn scale view")?;
+    let (base_buf, base_inner) = views.find_view(base_offset, mix_bytes)
+        .ok_or("hc_split_sinkhorn base view")?;
     let args = HcSplitSinkhornArgs {
         n_hc: n_hc as i32, sinkhorn_iters: sinkhorn_iters as i32,
-        n_rows: 1, mix_hc: (n_hc + n_hc * n_hc + n_hc) as i64,
-        nb01: 0, nb1: 0, eps,
+        n_rows: 1, mix_hc: mix_hc as i64,
+        nb01: mix_bytes, nb1: mix_bytes, eps,
     };
-    let device = bridge::device().ok_or("no device")?;
-    let zero = unsafe {
-        device.newBufferWithLength_options(64, MTLResourceOptions::StorageModeShared)
-    }.ok_or("zero buffer")?;
+    let nth = 1usize.max(256.min(1));
+    let n_tg = (1 + nth - 1) / nth;
     dispatch_pipeline("kernel_dsv4_hc_split_sinkhorn", &args,
-        &[(mixes.buf_ref(), mixes.offset_raw()), (Some(&*zero), 0),
-          (Some(&*zero), 0), (out.buf_ref(), out.offset_raw())],
-        (1, 1, 1), (256, 1, 1))
+        &[(mixes.buf_ref(), mixes.offset_raw()),
+          (Some(scale_buf), scale_inner),
+          (Some(base_buf), base_inner),
+          (out.buf_ref(), out.offset_raw())],
+        (n_tg, 1, 1), (nth, 1, 1))
 }
 
-// ─── HC Weighted Sum ─────────────────────────────────────────────────────────
+// ─── HC Weighted Sum ────────────────────────────────────────────────────
 
 pub fn hc_weighted_sum(
     out: &GpuTensor, residual_hc: &GpuTensor, weights: &GpuTensor,
     n_embd: u32, n_hc: u32,
 ) -> Result<(), &'static str> {
+    let n_tokens = 1u64;
+    let n_elem = n_embd as u64 * n_tokens;
+    let nth = 256.min(n_elem as usize).max(1);
+    let n_tg = (n_elem as usize + nth - 1) / nth;
     let args = HcWeightedSumArgs {
-        n_embd: n_embd as i64, n_hc: n_hc as i64, n_tokens: 1,
-        nb_x0: 4, nb_x1: (n_embd * 4) as u64, nb_x2: 0,
-        nb_w0: 4, nb_w1: 0, nb0: 4, nb1: 0,
+        n_embd: n_embd as i64, n_hc: n_hc as i64, n_tokens: n_tokens as i64,
+        nb_x0: 4, nb_x1: (n_embd * 4) as u64,
+        nb_x2: (n_hc as u64 * n_embd as u64 * 4),
+        nb_w0: 4, nb_w1: (n_hc * 4) as u64,
+        nb0: 4, nb1: (n_embd * 4) as u64,
     };
     dispatch_pipeline("kernel_dsv4_hc_weighted_sum", &args,
         &[(residual_hc.buf_ref(), residual_hc.offset_raw()),
           (weights.buf_ref(), weights.offset_raw()),
           (out.buf_ref(), out.offset_raw())],
-        (n_embd as usize, 1, 1), (256, 1, 1))
+        (n_tg, 1, 1), (nth, 1, 1))
 }
 
-// ─── HC Expand ───────────────────────────────────────────────────────────────
+// ─── HC Expand ──────────────────────────────────────────────────────────
 
-pub fn hc_expand(
-    out_hc: &GpuTensor, block_out: &GpuTensor, residual_hc: &GpuTensor,
-    split: &GpuTensor, n_embd: u32, n_hc: u32,
+pub fn hc_expand_tensor(
+    out_hc: &GpuTensor, block_out: &GpuTensor,
+    residual_hc: &GpuTensor,
+    post: &GpuTensor, comb: &GpuTensor,
+    n_embd: u32, n_hc: u32,
 ) -> Result<(), &'static str> {
-    let stride = (n_embd * 4) as u64;
+    let n_tokens = 1u64;
+    let n_elem = if n_hc == 4 { n_embd as u64 } else { n_embd as u64 * n_hc as u64 };
+    let nth = 256u64.min(n_elem).max(1) as usize;
+    let n_tg = (n_elem as usize + nth - 1) / nth;
+    let mix_hc = (2 * n_hc + n_hc * n_hc) as u64;
     let args = HcExpandArgs {
-        n_embd: n_embd as i64, n_hc: n_hc as i64, n_tokens: 1,
-        nb_block0: 4, nb_block1: stride,
-        nb_add0: 0, nb_add1: 0,
-        nb_res0: 4, nb_res1: stride, nb_res2: stride * n_hc as u64,
-        nb_post0: 4, nb_post1: 0,
-        nb_comb0: 4, nb_comb1: (n_hc * 4) as u64, nb_comb2: (n_hc * n_hc * 4) as u64,
-        nb0: 4, nb1: stride, nb2: stride * n_hc as u64,
+        n_embd: n_embd as i64, n_hc: n_hc as i64, n_tokens: n_tokens as i64,
+        nb_block0: 4, nb_block1: (n_embd * 4) as u64,
+        nb_add0: 4, nb_add1: (n_embd * 4) as u64,
+        nb_res0: 4, nb_res1: (n_embd * 4) as u64,
+        nb_res2: (n_hc as u64 * n_embd as u64 * 4),
+        nb_post0: 4, nb_post1: (n_hc * 4) as u64,
+        nb_comb0: 4, nb_comb1: (n_hc * 4) as u64,
+        nb_comb2: (n_hc as u64 * n_hc as u64 * 4),
+        nb0: 4, nb1: (n_embd * 4) as u64,
+        nb2: (n_hc as u64 * n_embd as u64 * 4),
         has_add: 0,
     };
     dispatch_pipeline("kernel_dsv4_hc_expand4", &args,
         &[(block_out.buf_ref(), block_out.offset_raw()),
-          (None, 0),
           (residual_hc.buf_ref(), residual_hc.offset_raw()),
-          (split.buf_ref(), split.offset_raw()),
-          (split.buf_ref(), split.offset_raw()),
+          (post.buf_ref(), post.offset_raw()),
+          (comb.buf_ref(), comb.offset_raw()),
+          (block_out.buf_ref(), block_out.offset_raw()),
           (out_hc.buf_ref(), out_hc.offset_raw())],
-        (n_embd as usize, 1, 1), (256, 1, 1))
+        (n_tg, 1, 1), (nth, 1, 1))
 }
 
-// ─── Softmax ─────────────────────────────────────────────────────────────────
+pub fn hc_expand_add_split_tensor(
+    out_hc: &GpuTensor, block_out: &GpuTensor,
+    block_add: &GpuTensor,
+    residual_hc: &GpuTensor, split: &GpuTensor,
+    n_embd: u32, n_hc: u32,
+) -> Result<(), &'static str> {
+    let n_tokens = 1u64;
+    let n_elem = if n_hc == 4 { n_embd as u64 } else { n_embd as u64 * n_hc as u64 };
+    let nth = 256u64.min(n_elem).max(1) as usize;
+    let n_tg = (n_elem as usize + nth - 1) / nth;
+    let mix_hc = (2 * n_hc + n_hc * n_hc) as u64;
+    let post_off = (n_hc * 4) as u64;
+    let comb_off = (2 * n_hc * 4) as u64;
+    let args = HcExpandArgs {
+        n_embd: n_embd as i64, n_hc: n_hc as i64, n_tokens: n_tokens as i64,
+        nb_block0: 4, nb_block1: (n_embd * 4) as u64,
+        nb_add0: 4, nb_add1: (n_embd * 4) as u64,
+        nb_res0: 4, nb_res1: (n_embd * 4) as u64,
+        nb_res2: (n_hc as u64 * n_embd as u64 * 4),
+        nb_post0: 4, nb_post1: mix_hc * 4,
+        nb_comb0: 4, nb_comb1: (n_hc * 4) as u64,
+        nb_comb2: mix_hc * 4,
+        nb0: 4, nb1: (n_embd * 4) as u64,
+        nb2: (n_hc as u64 * n_embd as u64 * 4),
+        has_add: 1,
+    };
+    dispatch_pipeline("kernel_dsv4_hc_expand4", &args,
+        &[(block_out.buf_ref(), block_out.offset_raw()),
+          (residual_hc.buf_ref(), residual_hc.offset_raw()),
+          (split.buf_ref(), split.offset_raw() + post_off),
+          (split.buf_ref(), split.offset_raw() + comb_off),
+          (block_add.buf_ref(), block_add.offset_raw()),
+          (out_hc.buf_ref(), out_hc.offset_raw())],
+        (n_tg, 1, 1), (nth, 1, 1))
+}
+
+// ─── Output HC Weights ──────────────────────────────────────────────────
+
+pub fn output_hc_weights(
+    out: &GpuTensor, pre: &GpuTensor,
+    views: &ModelViews,
+    scale_offset: u64, base_offset: u64,
+    n_hc: u32, eps: f32,
+) -> Result<(), &'static str> {
+    let row_bytes = (n_hc * 4) as u64;
+    let (scale_buf, scale_inner) = views.find_view(scale_offset, 4)
+        .ok_or("output_hc_weights scale view")?;
+    let (base_buf, base_inner) = views.find_view(base_offset, row_bytes)
+        .ok_or("output_hc_weights base view")?;
+
+    let mul_p = make_bin_pipeline(2, 1, false, true).ok_or("mul_scalar pipeline")?;
+    let add_p = make_bin_pipeline(0, 1, false, false).ok_or("add pipeline")?;
+    let sig_p = make_unary_pipeline(102).ok_or("sigmoid pipeline")?;
+    let sca_p = make_unary_pipeline(10).ok_or("scale pipeline")?;
+
+    let n_tokens = 1u32;
+    let mul_args = metal_args::BinArgs {
+        ne00: n_hc as i32, ne01: n_tokens as i32, ne02: 1, ne03: 1,
+        nb00: 4, nb01: row_bytes, nb02: row_bytes, nb03: row_bytes,
+        ne10: 1, ne11: 1, ne12: 1, ne13: 1,
+        nb10: 4, nb11: 4, nb12: 4, nb13: 4,
+        ne0: n_hc as i32, ne1: n_tokens as i32, ne2: 1, ne3: 1,
+        nb0: 4, nb1: row_bytes, nb2: row_bytes, nb3: row_bytes,
+        offs: 0, o1: [0; 8],
+    };
+    let add_args = metal_args::BinArgs {
+        ne00: n_hc as i32, ne01: n_tokens as i32, ne02: 1, ne03: 1,
+        nb00: 4, nb01: row_bytes, nb02: row_bytes, nb03: row_bytes,
+        ne10: n_hc as i32, ne11: 1, ne12: 1, ne13: 1,
+        nb10: 4, nb11: row_bytes, nb12: row_bytes, nb13: row_bytes,
+        ne0: n_hc as i32, ne1: n_tokens as i32, ne2: 1, ne3: 1,
+        nb0: 4, nb1: row_bytes, nb2: row_bytes, nb3: row_bytes,
+        offs: 0, o1: [0; 8],
+    };
+    let unary_c4 = n_hc / 4;
+    let sig_args = UnaryArgs {
+        ne00: unary_c4 as i32, ne01: n_tokens as i32, ne02: 1, ne03: 1,
+        nb00: 4, nb01: row_bytes, nb02: row_bytes, nb03: row_bytes,
+        ne0: unary_c4 as i32, ne1: n_tokens as i32, ne2: 1, ne3: 1,
+        nb0: 4, nb1: row_bytes, nb2: row_bytes, nb3: row_bytes,
+        slope: 0.0, scale: 0.0, bias: 0.0, val: 0.0, min_: 0.0, max_: 0.0,
+    };
+    let sca_args = UnaryArgs {
+        ne00: unary_c4 as i32, ne01: n_tokens as i32, ne02: 1, ne03: 1,
+        nb00: 4, nb01: row_bytes, nb02: row_bytes, nb03: row_bytes,
+        ne0: unary_c4 as i32, ne1: n_tokens as i32, ne2: 1, ne3: 1,
+        nb0: 4, nb1: row_bytes, nb2: row_bytes, nb3: row_bytes,
+        slope: 0.0, scale: 1.0, bias: eps, val: 0.0, min_: 0.0, max_: 0.0,
+    };
+
+    let mut mul_nth = 1usize;
+    while 2 * mul_nth < mul_args.ne0 as usize && mul_nth < 256 { mul_nth *= 2; }
+    let mut add_nth = 1usize;
+    while 2 * add_nth < add_args.ne0 as usize && add_nth < 256 { add_nth *= 2; }
+    let unary_nth = (unary_c4 as usize).min(256).max(1);
+    let unary_nk0 = (unary_c4 as usize + unary_nth - 1) / unary_nth;
+
+    let queue = bridge::queue().ok_or("no queue")?;
+    let cb = queue.commandBuffer().ok_or("no command buffer")?;
+    let enc = cb.computeCommandEncoder().ok_or("no encoder")?;
+
+    let pre_off = pre.offset_raw();
+    let out_off = out.offset_raw();
+    let out_ref = out.buf_ref();
+    let pre_ref = pre.buf_ref();
+
+    // Dispatch 1: bin_mul_scalar
+    unsafe {
+        let args_buf = bridge::device().ok_or("no device")?.newBufferWithBytes_length_options(
+            NonNull::new(&mul_args as *const _ as *mut c_void).unwrap(),
+            std::mem::size_of::<metal_args::BinArgs>(),
+            MTLResourceOptions::StorageModeShared,
+        ).ok_or("args buf")?;
+        enc.setComputePipelineState(&*mul_p);
+        enc.setBuffer_offset_atIndex(Some(&*args_buf), 0, 0);
+        if let Some(b) = pre_ref { enc.setBuffer_offset_atIndex(Some(b), pre_off as usize, 1); }
+        enc.setBuffer_offset_atIndex(Some(scale_buf), scale_inner as usize, 2);
+        if let Some(b) = out_ref { enc.setBuffer_offset_atIndex(Some(b), out_off as usize, 3); }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: mul_args.ne01 as usize, height: 1, depth: 1 },
+            MTLSize { width: mul_nth, height: 1, depth: 1 },
+        );
+    }
+
+    // Dispatch 2: add
+    unsafe {
+        let args_buf = bridge::device().ok_or("no device")?.newBufferWithBytes_length_options(
+            NonNull::new(&add_args as *const _ as *mut c_void).unwrap(),
+            std::mem::size_of::<metal_args::BinArgs>(),
+            MTLResourceOptions::StorageModeShared,
+        ).ok_or("args buf")?;
+        enc.setComputePipelineState(&*add_p);
+        enc.setBuffer_offset_atIndex(Some(&*args_buf), 0, 0);
+        if let Some(b) = out_ref { enc.setBuffer_offset_atIndex(Some(b), out_off as usize, 1); }
+        enc.setBuffer_offset_atIndex(Some(base_buf), base_inner as usize, 2);
+        if let Some(b) = out_ref { enc.setBuffer_offset_atIndex(Some(b), out_off as usize, 3); }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: add_args.ne01 as usize, height: 1, depth: 1 },
+            MTLSize { width: add_nth, height: 1, depth: 1 },
+        );
+    }
+
+    // Dispatch 3: sigmoid
+    unsafe {
+        let args_buf = bridge::device().ok_or("no device")?.newBufferWithBytes_length_options(
+            NonNull::new(&sig_args as *const _ as *mut c_void).unwrap(),
+            std::mem::size_of::<UnaryArgs>(),
+            MTLResourceOptions::StorageModeShared,
+        ).ok_or("args buf")?;
+        enc.setComputePipelineState(&*sig_p);
+        enc.setBuffer_offset_atIndex(Some(&*args_buf), 0, 0);
+        if let Some(b) = out_ref { enc.setBuffer_offset_atIndex(Some(b), out_off as usize, 1); }
+        if let Some(b) = out_ref { enc.setBuffer_offset_atIndex(Some(b), out_off as usize, 2); }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: unary_nk0 * sig_args.ne01 as usize, height: 1, depth: 1 },
+            MTLSize { width: unary_nth, height: 1, depth: 1 },
+        );
+    }
+
+    // Dispatch 4: scale
+    unsafe {
+        let args_buf = bridge::device().ok_or("no device")?.newBufferWithBytes_length_options(
+            NonNull::new(&sca_args as *const _ as *mut c_void).unwrap(),
+            std::mem::size_of::<UnaryArgs>(),
+            MTLResourceOptions::StorageModeShared,
+        ).ok_or("args buf")?;
+        enc.setComputePipelineState(&*sca_p);
+        enc.setBuffer_offset_atIndex(Some(&*args_buf), 0, 0);
+        if let Some(b) = out_ref { enc.setBuffer_offset_atIndex(Some(b), out_off as usize, 1); }
+        if let Some(b) = out_ref { enc.setBuffer_offset_atIndex(Some(b), out_off as usize, 2); }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: unary_nk0 * sca_args.ne01 as usize, height: 1, depth: 1 },
+            MTLSize { width: unary_nth, height: 1, depth: 1 },
+        );
+    }
+
+    enc.endEncoding();
+    cb.commit();
+    wait_gpu(&*cb)
+}
+
+// ─── Softmax ────────────────────────────────────────────────────────────
 
 pub fn softmax(
     out: &GpuTensor, src: &GpuTensor, _mask: Option<&GpuTensor>,
@@ -478,7 +822,7 @@ pub fn softmax(
         (rows as usize, 1, 1), (256, 1, 1))
 }
 
-// ─── SwiGLU ──────────────────────────────────────────────────────────────────
+// ─── SwiGLU ─────────────────────────────────────────────────────────────
 
 pub fn swiglu(
     out: &GpuTensor, gate: &GpuTensor, up: &GpuTensor,
@@ -497,14 +841,17 @@ pub fn swiglu(
         (1, 1, 1), (256, 1, 1))
 }
 
-// ─── F16 matmul ──────────────────────────────────────────────────────────────
+// ─── F16 matmul ─────────────────────────────────────────────────────────
 
 pub fn matmul_f16(
     out: &GpuTensor, views: &ModelViews,
     weight_offset: u64, in_dim: u64, out_dim: u64,
     x: &GpuTensor, n_tok: u64,
 ) -> Result<(), &'static str> {
-    let nr0: i32 = if out_dim % 4 == 0 { 4 } else { 2 };
+    let nsg = std::cmp::min(8i16, ((in_dim + 127) / 128) as i16).max(1);
+    let nr0: i32 = 2;
+    let use_4 = in_dim % 4 == 0;
+    let pipeline_name = if use_4 { "kernel_mul_mv_f16_f32_4" } else { "kernel_mul_mv_f16_f32" };
     let args = MulMvArgs {
         ne00: in_dim as i32, ne01: out_dim as i32, ne02: 1,
         nb00: 2, nb01: in_dim * 2, nb02: 0, nb03: 0,
@@ -516,23 +863,25 @@ pub fn matmul_f16(
     let weight_bytes = in_dim * out_dim * 2;
     let (wbuf, woff) = views.find_view(weight_offset, weight_bytes)
         .ok_or("f16 weight view not found")?;
-    let p = make_matmul_pipeline("kernel_mul_mv_f16_f32", nr0 as i16, 1)
+    let p = make_matmul_pipeline(pipeline_name, nsg, 1)
         .ok_or("f16 matmul pipeline")?;
-    dispatch_with_args(&*p, &args,
+    let smem = (32 * nr0 as u64 * 4) as u64;
+    dispatch_with_args_tg(&*p, &args,
         &[(Some(wbuf), woff), (x.buf_ref(), x.offset_raw()),
           (out.buf_ref(), out.offset_raw())],
         ((out_dim / nr0 as u64 + 1) as usize * n_tok as usize, 1, 1),
-        (256, 1, 1))
+        (32, nsg as usize, 1), smem)
 }
 
-// ─── Q8_0 matmul ─────────────────────────────────────────────────────────────
+// ─── Q8_0 matmul ────────────────────────────────────────────────────────
 
 pub fn matmul_q8_0(
     out: &GpuTensor, views: &ModelViews,
     weight_offset: u64, in_dim: u64, out_dim: u64,
     x: &GpuTensor, n_tok: u64,
 ) -> Result<(), &'static str> {
-    let nr0: i32 = if out_dim % 4 == 0 { 4 } else { 2 };
+    let nsg: i16 = 4;
+    let nr0: i32 = 2;
     let nb01 = in_dim / 32 * 34;
     let args = MulMvArgs {
         ne00: in_dim as i32, ne01: out_dim as i32, ne02: 1,
@@ -545,16 +894,17 @@ pub fn matmul_q8_0(
     let weight_bytes = nb01 * out_dim;
     let (wbuf, woff) = views.find_view(weight_offset, weight_bytes)
         .ok_or("q8_0 weight view not found")?;
-    let p = make_matmul_pipeline("kernel_mul_mv_q8_0_f32", nr0 as i16, 1)
+    let p = make_matmul_pipeline("kernel_mul_mv_q8_0_f32", nsg, 1)
         .ok_or("q8_0 matmul pipeline")?;
-    dispatch_with_args(&*p, &args,
+    let smem = (32 * nr0 as u64 * 4) as u64;
+    dispatch_with_args_tg(&*p, &args,
         &[(Some(wbuf), woff), (x.buf_ref(), x.offset_raw()),
           (out.buf_ref(), out.offset_raw())],
         ((out_dim / nr0 as u64 + 1) as usize * n_tok as usize, 1, 1),
-        (256, 1, 1))
+        (32, nsg as usize, 1), smem)
 }
 
-// ─── KV FP8 Store ────────────────────────────────────────────────────────────
+// ─── KV FP8 Store ───────────────────────────────────────────────────────
 
 pub fn kv_fp8_store(
     kv: &GpuTensor, raw_cache: &GpuTensor,
@@ -569,7 +919,7 @@ pub fn kv_fp8_store(
         (1, 1, 1), (64, 1, 1))
 }
 
-// ─── Compressor Store One ────────────────────────────────────────────────────
+// ─── Compressor Store One ───────────────────────────────────────────────
 
 pub fn compressor_store_one(
     kv: &GpuTensor, score: &GpuTensor,
@@ -577,7 +927,7 @@ pub fn compressor_store_one(
     state_kv: &GpuTensor, state_score: &GpuTensor,
     width: u32, ratio: u32, pos: u32,
 ) -> Result<(), &'static str> {
-    let ape_bytes = ratio as u64 * width as u64 * 2; // f16
+    let ape_bytes = ratio as u64 * width as u64 * 2;
     let (ape_buf, ape_off) = views.find_view(ape_offset, ape_bytes)
         .ok_or("ape view not found")?;
     let args = CompressorStoreOneArgs { width, ratio, pos, ape_type: 1 };
@@ -590,7 +940,7 @@ pub fn compressor_store_one(
         (width as usize, 1, 1), (256, 1, 1))
 }
 
-// ─── Embedding: get_rows f16 ─────────────────────────────────────────────────
+// ─── Embedding ──────────────────────────────────────────────────────────
 
 pub fn embed_tokens(
     out: &GpuTensor, views: &ModelViews,
@@ -624,7 +974,7 @@ pub fn embed_tokens(
         ((n + 31) / 32, 1, 1), (32, 1, 1))
 }
 
-// ─── Router finalize one ─────────────────────────────────────────────────────
+// ─── Router ─────────────────────────────────────────────────────────────
 
 pub fn router_select_one(
     probs: &GpuTensor, bias: &GpuTensor,
@@ -647,8 +997,6 @@ pub fn router_select_one(
         (1, 1, 1), (256, 1, 1))
 }
 
-// ─── Router weights one ──────────────────────────────────────────────────────
-
 pub fn router_weights_one(
     probs: &GpuTensor, selected: &GpuTensor, weights: &GpuTensor,
 ) -> Result<(), &'static str> {
@@ -661,7 +1009,7 @@ pub fn router_weights_one(
         (1, 1, 1), (6, 1, 1))
 }
 
-// ─── MoE SwiGLU with route weight ────────────────────────────────────────────
+// ─── MoE SwiGLU with route weight ───────────────────────────────────────
 
 pub fn moe_swiglu_weight(
     gate: &GpuTensor, up: &GpuTensor, mid: &GpuTensor,
@@ -683,7 +1031,7 @@ pub fn moe_swiglu_weight(
         (1, 1, 1), (256, 1, 1))
 }
 
-// ─── Indexed mixed attention ─────────────────────────────────────────────────
+// ─── Indexed mixed attention ────────────────────────────────────────────
 
 pub fn indexed_attention(
     heads: &GpuTensor, q: &GpuTensor,
@@ -715,17 +1063,19 @@ pub fn indexed_attention(
         None
     };
     let sink_ref = sinks.buf_ref().or(_dummy.as_deref());
-    dispatch_pipeline("kernel_dsv4_indexed_mixed_attention_heads8", &args,
+    // kernel uses threadgroup float4 *kv_shared[128] = 2048 bytes
+    dispatch_pipeline_tg("kernel_dsv4_indexed_mixed_attention_heads8", &args,
         &[(q.buf_ref(), q.offset_raw()),
           (raw_kv.buf_ref(), raw_kv.offset_raw()),
           (comp_kv.buf_ref(), comp_kv.offset_raw()),
           (topk.buf_ref(), topk.offset_raw()),
           (sink_ref, 0),
           (heads.buf_ref(), heads.offset_raw())],
-        (n_tokens as usize, (n_head / 8 + 1) as usize, 1), (128, 1, 1))
+        (n_tokens as usize, (n_head / 8 + 1) as usize, 1), (128, 1, 1),
+        2048) // 128 * sizeof(float4)
 }
 
-// ─── Directional steering project ────────────────────────────────────────────
+// ─── Directional steering project ───────────────────────────────────────
 
 pub fn directional_steering_project(
     x: &GpuTensor, directions: &GpuTensor,
@@ -740,7 +1090,7 @@ pub fn directional_steering_project(
         (rows as usize, 1, 1), (256, 1, 1))
 }
 
-// ─── Expert matmul: IQ2_XXS pair ─────────────────────────────────────────────
+// ─── Expert matmul: IQ2_XXS pair ────────────────────────────────────────
 
 pub fn matmul_id_iq2_xxs_pair(
     dst_gate: &GpuTensor, dst_up: &GpuTensor,
@@ -748,17 +1098,17 @@ pub fn matmul_id_iq2_xxs_pair(
     in_dim: u32, out_dim: u32, n_expert: u32,
     x: &GpuTensor, selected: &[i32],
 ) -> Result<(), &'static str> {
-    let nr0: u32 = if out_dim % 4 == 0 { 4 } else { 2 };
-    let step = in_dim as u64 / 32 * 66 * out_dim as u64;
-    let total_bytes = step * n_expert as u64 * 2; // gate + up interleaved
+    let nr0: u32 = 4;
+    let step = in_dim as u64 / 256 * 66 * out_dim as u64;
+    let total_bytes = step * n_expert as u64 * 2;
     let (wbuf, woff) = views.find_view(gate_offset, total_bytes)
         .ok_or("iq2 expert view not found")?;
     let args = MulMvIdArgs {
         nei0: 1, nei1: selected.len() as i32, nbi1: 4,
         ne00: in_dim as i32, ne01: out_dim as i32,
-        ne02: (n_expert * in_dim / 32 * 66) as i32,
-        nb00: 66, nb01: in_dim as u64 / 32 * 66,
-        nb02: in_dim as u64 / 32 * 66 * out_dim as u64,
+        ne02: (n_expert * in_dim / 256 * 66) as i32,
+        nb00: 66, nb01: in_dim as u64 / 256 * 66,
+        nb02: in_dim as u64 / 256 * 66 * out_dim as u64,
         ne10: in_dim as i32, ne11: 1, ne12: 1, ne13: 1,
         nb10: 4, nb11: in_dim as u64 * 4,
         nb12: in_dim as u64 * 4,
@@ -773,11 +1123,12 @@ pub fn matmul_id_iq2_xxs_pair(
             MTLResourceOptions::StorageModeShared,
         )
     }.ok_or("sel buffer")?;
-    let nsg: i16 = if nr0 == 4 { 4 } else { 2 };
+    let nsg: i16 = 4;
     let p = make_matmul_pipeline("kernel_mul_mv_id_iq2_xxs_pair_f32", nsg, 1)
         .ok_or("iq2 pair pipeline")?;
     let up_off = woff + step * n_expert as u64;
-    dispatch_with_args(&*p, &args,
+    let smem = (32 * nr0 * 4) as u64;
+    dispatch_with_args_tg(&*p, &args,
         &[(Some(wbuf), woff),
           (Some(wbuf), up_off),
           (x.buf_ref(), x.offset_raw()),
@@ -785,10 +1136,10 @@ pub fn matmul_id_iq2_xxs_pair(
           (dst_up.buf_ref(), dst_up.offset_raw()),
           (Some(&*sel_buf), 0)],
         ((out_dim / nr0 + 1) as usize, 1, selected.len()),
-        (256, 1, 1))
+        (32, nsg as usize, 1), smem)
 }
 
-// ─── Expert matmul: Q2_K sum6 ────────────────────────────────────────────────
+// ─── Expert matmul: Q2_K sum6 ───────────────────────────────────────────
 
 #[allow(non_snake_case)]
 pub fn matmul_id_q2_K_sum6(
@@ -822,10 +1173,12 @@ pub fn matmul_id_q2_K_sum6(
             MTLResourceOptions::StorageModeShared,
         )
     }.ok_or("sel buffer")?;
-    let p = make_matmul_pipeline("kernel_mul_mv_id_q2_K_sum6_f32", 4, 1)
+    let nsg: i16 = 4;
+    let p = make_matmul_pipeline("kernel_mul_mv_id_q2_K_sum6_f32", nsg, 1)
         .ok_or("q2 sum6 pipeline")?;
     let up_off = woff + step * n_expert as u64;
-    dispatch_with_args(&*p, &args,
+    let smem = (32 * nr0 * 4) as u64;
+    dispatch_with_args_tg(&*p, &args,
         &[(Some(wbuf), woff),
           (Some(wbuf), up_off),
           (x.buf_ref(), x.offset_raw()),
@@ -833,10 +1186,10 @@ pub fn matmul_id_q2_K_sum6(
           (dst_up.buf_ref(), dst_up.offset_raw()),
           (Some(&*sel_buf), 0)],
         ((out_dim / nr0 + 1) as usize, 1, selected.len()),
-        (256, 1, 1))
+        (32, nsg as usize, 1), smem)
 }
 
-// ─── Expert matmul: Q4_K sum6 ────────────────────────────────────────────────
+// ─── Expert matmul: Q4_K sum6 ───────────────────────────────────────────
 
 #[allow(non_snake_case)]
 pub fn matmul_id_q4_K_sum6(
@@ -870,10 +1223,12 @@ pub fn matmul_id_q4_K_sum6(
             MTLResourceOptions::StorageModeShared,
         )
     }.ok_or("sel buffer")?;
-    let p = make_matmul_pipeline("kernel_mul_mv_id_q4_K_sum6_f32", 2, 1)
+    let nsg: i16 = 4;
+    let p = make_matmul_pipeline("kernel_mul_mv_id_q4_K_sum6_f32", nsg, 1)
         .ok_or("q4 sum6 pipeline")?;
     let up_off = woff + step * n_expert as u64;
-    dispatch_with_args(&*p, &args,
+    let smem = (32 * nr0 * 4) as u64;
+    dispatch_with_args_tg(&*p, &args,
         &[(Some(wbuf), woff),
           (Some(wbuf), up_off),
           (x.buf_ref(), x.offset_raw()),
@@ -881,10 +1236,182 @@ pub fn matmul_id_q4_K_sum6(
           (dst_up.buf_ref(), dst_up.offset_raw()),
           (Some(&*sel_buf), 0)],
         ((out_dim / nr0 + 1) as usize, 1, selected.len()),
-        (256, 1, 1))
+        (32, nsg as usize, 1), smem)
 }
 
-// ─── Indexer score one ───────────────────────────────────────────────────────
+// ─── Expert matmul: Q8_0 id (single output) ────────────────────────────
+
+pub fn matmul_id_q8_0_f32(
+    dst: &GpuTensor,
+    views: &ModelViews, weight_offset: u64,
+    in_dim: u32, out_dim: u32, n_expert: u32,
+    x: &GpuTensor, selected: &[i32],
+) -> Result<(), &'static str> {
+    let nr0: u32 = 2;
+    let nb01 = in_dim as u64 / 32 * 34;
+    let step = nb01 * out_dim as u64;
+    let total_bytes = step * n_expert as u64;
+    let (wbuf, woff) = views.find_view(weight_offset, total_bytes)
+        .ok_or("q8_0 id expert view not found")?;
+    let args = MulMvIdArgs {
+        nei0: 1, nei1: selected.len() as i32, nbi1: 4,
+        ne00: in_dim as i32, ne01: out_dim as i32,
+        ne02: (n_expert * in_dim / 32 * 34) as i32,
+        nb00: 34, nb01, nb02: nb01 * out_dim as u64,
+        ne10: in_dim as i32, ne11: 1, ne12: 1, ne13: 1,
+        nb10: 4, nb11: in_dim as u64 * 4,
+        nb12: in_dim as u64 * 4,
+        ne0: out_dim as i32, ne1: 1, nb1: out_dim as u64 * 4,
+        nr0: nr0 as i32,
+    };
+    let device = bridge::device().ok_or("no device")?;
+    let sel_buf = unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::new(selected.as_ptr() as *mut c_void).unwrap(),
+            selected.len() * 4,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }.ok_or("sel buffer")?;
+    let nsg: i16 = 4;
+    let p = make_matmul_pipeline("kernel_mul_mv_id_q8_0_f32", nsg, 1)
+        .ok_or("q8_0 id pipeline")?;
+    let smem = (32 * nr0 * 4) as u64;
+    dispatch_with_args_tg(&*p, &args,
+        &[(Some(wbuf), woff),
+          (x.buf_ref(), x.offset_raw()),
+          (dst.buf_ref(), dst.offset_raw()),
+          (Some(&*sel_buf), 0)],
+        ((out_dim / nr0 + 1) as usize, 1, selected.len()),
+        (32, nsg as usize, 1), smem)
+}
+
+// ─── Expert matmul: Q2_K id (single output for down projection) ─────────
+
+pub fn matmul_id_q2_K_f32(
+    dst: &GpuTensor,
+    views: &ModelViews, weight_offset: u64,
+    in_dim: u32, out_dim: u32, n_expert: u32,
+    x: &GpuTensor, selected: &[i32],
+) -> Result<(), &'static str> {
+    let nr0: u32 = 4;
+    let nb01 = in_dim as u64 / 256 * 84;
+    let step = nb01 * out_dim as u64;
+    let total_bytes = step * n_expert as u64;
+    let (wbuf, woff) = views.find_view(weight_offset, total_bytes)
+        .ok_or("q2_K id expert view not found")?;
+    let args = MulMvIdArgs {
+        nei0: 1, nei1: selected.len() as i32, nbi1: 4,
+        ne00: in_dim as i32, ne01: out_dim as i32,
+        ne02: (n_expert * in_dim / 256 * 84) as i32,
+        nb00: 84, nb01, nb02: nb01 * out_dim as u64,
+        ne10: in_dim as i32, ne11: 1, ne12: 1, ne13: 1,
+        nb10: 4, nb11: in_dim as u64 * 4, nb12: in_dim as u64 * 4,
+        ne0: out_dim as i32, ne1: 1, nb1: out_dim as u64 * 4,
+        nr0: nr0 as i32,
+    };
+    let device = bridge::device().ok_or("no device")?;
+    let sel_buf = unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::new(selected.as_ptr() as *mut c_void).unwrap(),
+            selected.len() * 4, MTLResourceOptions::StorageModeShared,
+        )
+    }.ok_or("sel buffer")?;
+    let nsg: i16 = 4;
+    let p = make_matmul_pipeline("kernel_mul_mv_id_q2_K_f32", nsg, 1)
+        .ok_or("q2_K id pipeline")?;
+    let smem = (32 * nr0 * 4) as u64;
+    dispatch_with_args_tg(&*p, &args,
+        &[(Some(wbuf), woff), (x.buf_ref(), x.offset_raw()),
+          (dst.buf_ref(), dst.offset_raw()), (Some(&*sel_buf), 0)],
+        ((out_dim / nr0 + 1) as usize, 1, selected.len()),
+        (32, nsg as usize, 1), smem)
+}
+
+// ─── Expert matmul: Q4_K id (single output for down projection) ─────────
+
+pub fn matmul_id_q4_K_f32(
+    dst: &GpuTensor,
+    views: &ModelViews, weight_offset: u64,
+    in_dim: u32, out_dim: u32, n_expert: u32,
+    x: &GpuTensor, selected: &[i32],
+) -> Result<(), &'static str> {
+    let nr0: u32 = 2;
+    let nb01 = in_dim as u64 / 256 * 144;
+    let step = nb01 * out_dim as u64;
+    let total_bytes = step * n_expert as u64;
+    let (wbuf, woff) = views.find_view(weight_offset, total_bytes)
+        .ok_or("q4_K id expert view not found")?;
+    let args = MulMvIdArgs {
+        nei0: 1, nei1: selected.len() as i32, nbi1: 4,
+        ne00: in_dim as i32, ne01: out_dim as i32,
+        ne02: (n_expert * in_dim / 256 * 144) as i32,
+        nb00: 144, nb01, nb02: nb01 * out_dim as u64,
+        ne10: in_dim as i32, ne11: 1, ne12: 1, ne13: 1,
+        nb10: 4, nb11: in_dim as u64 * 4, nb12: in_dim as u64 * 4,
+        ne0: out_dim as i32, ne1: 1, nb1: out_dim as u64 * 4,
+        nr0: nr0 as i32,
+    };
+    let device = bridge::device().ok_or("no device")?;
+    let sel_buf = unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::new(selected.as_ptr() as *mut c_void).unwrap(),
+            selected.len() * 4, MTLResourceOptions::StorageModeShared,
+        )
+    }.ok_or("sel buffer")?;
+    let nsg: i16 = 4;
+    let p = make_matmul_pipeline("kernel_mul_mv_id_q4_K_f32", nsg, 1)
+        .ok_or("q4_K id pipeline")?;
+    let smem = (32 * nr0 * 4) as u64;
+    dispatch_with_args_tg(&*p, &args,
+        &[(Some(wbuf), woff), (x.buf_ref(), x.offset_raw()),
+          (dst.buf_ref(), dst.offset_raw()), (Some(&*sel_buf), 0)],
+        ((out_dim / nr0 + 1) as usize, 1, selected.len()),
+        (32, nsg as usize, 1), smem)
+}
+
+// ─── Expert matmul: IQ2_XXS id (single output for down projection) ──────
+
+pub fn matmul_id_iq2_xxs_f32(
+    dst: &GpuTensor,
+    views: &ModelViews, weight_offset: u64,
+    in_dim: u32, out_dim: u32, n_expert: u32,
+    x: &GpuTensor, selected: &[i32],
+) -> Result<(), &'static str> {
+    let nr0: u32 = 4;
+    let nb01 = in_dim as u64 / 256 * 66;
+    let step = nb01 * out_dim as u64;
+    let total_bytes = step * n_expert as u64;
+    let (wbuf, woff) = views.find_view(weight_offset, total_bytes)
+        .ok_or("iq2_xxs id expert view not found")?;
+    let args = MulMvIdArgs {
+        nei0: 1, nei1: selected.len() as i32, nbi1: 4,
+        ne00: in_dim as i32, ne01: out_dim as i32,
+        ne02: (n_expert * in_dim / 256 * 66) as i32,
+        nb00: 66, nb01, nb02: nb01 * out_dim as u64,
+        ne10: in_dim as i32, ne11: 1, ne12: 1, ne13: 1,
+        nb10: 4, nb11: in_dim as u64 * 4, nb12: in_dim as u64 * 4,
+        ne0: out_dim as i32, ne1: 1, nb1: out_dim as u64 * 4,
+        nr0: nr0 as i32,
+    };
+    let device = bridge::device().ok_or("no device")?;
+    let sel_buf = unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::new(selected.as_ptr() as *mut c_void).unwrap(),
+            selected.len() * 4, MTLResourceOptions::StorageModeShared,
+        )
+    }.ok_or("sel buffer")?;
+    let nsg: i16 = 4;
+    let p = make_matmul_pipeline("kernel_mul_mv_id_iq2_xxs_f32", nsg, 1)
+        .ok_or("iq2_xxs id pipeline")?;
+    let smem = (32 * nr0 * 4) as u64;
+    dispatch_with_args_tg(&*p, &args,
+        &[(Some(wbuf), woff), (x.buf_ref(), x.offset_raw()),
+          (dst.buf_ref(), dst.offset_raw()), (Some(&*sel_buf), 0)],
+        ((out_dim / nr0 + 1) as usize, 1, selected.len()),
+        (32, nsg as usize, 1), smem)
+}
+
+// ─── Indexer score one ──────────────────────────────────────────────────
 
 pub fn indexer_score_one(
     scores: &GpuTensor, q: &GpuTensor,
@@ -902,7 +1429,7 @@ pub fn indexer_score_one(
         score_token_stride: 0, scale,
     };
     let weight_bytes = n_head as u64 * 4;
-    let (w_opt, w_off): (Option<&ProtocolObject<dyn MTLBuffer>>, u64) = if weight_offset != 0 {
+    let (w_opt, w_off) = if weight_offset != 0 {
         views.find_view(weight_offset, weight_bytes)
             .map(|(b, o)| (Some(b), o))
             .unwrap_or((None, 0))
@@ -917,7 +1444,7 @@ pub fn indexer_score_one(
         (n_comp as usize, 1, 1), (128, 1, 1))
 }
 
-// ─── Softmax pool ────────────────────────────────────────────────────────────
+// ─── Softmax pool ───────────────────────────────────────────────────────
 
 pub fn softmax_pool(
     dst: &GpuTensor, kv: &GpuTensor, score: &GpuTensor,
@@ -937,7 +1464,7 @@ pub fn softmax_pool(
         (head_dim as usize, 1, 1), (256, 1, 1))
 }
 
-// ─── Softplus + sqrt ─────────────────────────────────────────────────────────
+// ─── Softplus + sqrt ────────────────────────────────────────────────────
 
 pub fn softplus_sqrt(
     dst: &GpuTensor, src: &GpuTensor, n: u32,
@@ -956,7 +1483,7 @@ pub fn softplus_sqrt(
         (1, 1, 1), (256, 1, 1))
 }
 
-// ─── Flash attention (prefill) ───────────────────────────────────────────────
+// ─── Flash attention (prefill) ──────────────────────────────────────────
 
 pub fn flash_attn_prefill(
     dst: &GpuTensor, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor,
@@ -996,7 +1523,7 @@ pub fn flash_attn_prefill(
         (n_tokens as usize, n_head as usize, 1), (256, 1, 1))
 }
 
-// ─── Repeat f32 ──────────────────────────────────────────────────────────────
+// ─── Repeat f32 ─────────────────────────────────────────────────────────
 
 pub fn repeat_f32(
     dst: &GpuTensor, src: &GpuTensor,
@@ -1015,7 +1542,7 @@ pub fn repeat_f32(
         (ne1 as usize, 1, 1), (256, 1, 1))
 }
 
-// ─── Compressor ratio4 shift ─────────────────────────────────────────────────
+// ─── Compressor ratio4 shift ────────────────────────────────────────────
 
 pub fn compressor_ratio4_shift(
     state_kv: &GpuTensor, state_score: &GpuTensor, width: u32,
@@ -1027,6 +1554,5 @@ pub fn compressor_ratio4_shift(
         (4 * width as usize, 1, 1), (256, 1, 1))
 }
 
-// Re-export alias
 #[allow(unused_imports)]
 pub use kv_fp8_store as kv_fp8_store_raw;

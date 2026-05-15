@@ -230,12 +230,9 @@ fn run_one_shot(mut sess: ds4_rs::session::SessionState, opts: &RunArgs, prompt:
     // Time generation separately, stream tokens as they are produced
     let t_gen_start = std::time::Instant::now();
     let mut result_tokens = Vec::new();
-    let mut dbg_count = 0usize;
     for _ in 0..opts.n_predict {
-        let (token, score) = sess.argmax();
-        let token = if opts.temperature < 0.01 { token } else { sess.sample(opts.temperature, opts.top_k) };
-        if dbg_count < 5 { eprintln!("ds4 [DBG] gen token={} score={:.4}", token, score); dbg_count += 1; }
-        if sess.is_stop_token(token) { eprintln!("ds4 [DBG] stop token {}", token); break; }
+        let token = if opts.temperature < 0.01 { sess.argmax().0 } else { sess.sample(opts.temperature, opts.top_k) };
+        if sess.is_stop_token(token) { break; }
         result_tokens.push(token);
         if let Some(ref vocab) = sess.vocab {
             let txt = ds4_rs::tokenizer::token_decode(vocab, &[token]);

@@ -38,6 +38,10 @@ impl GpuTensor {
         self.buffer.0.as_deref()
     }
 
+    pub fn retain_buf(&self) -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
+        self.buffer.0.clone()
+    }
+
     pub fn bytes(&self) -> u64 { self.bytes }
     pub fn offset_raw(&self) -> u64 { self.offset }
 
