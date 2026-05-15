@@ -3,6 +3,8 @@ use crate::model_view::ModelViews;
 use crate::gguf::*;
 use crate::tensor::GpuTensor;
 use crate::ops;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLBuffer;
 
 pub struct GpuGraph {
     pub cur_hc: GpuTensor,
@@ -34,6 +36,7 @@ pub struct GpuGraph {
     pub routed_gate: GpuTensor,
     pub routed_up: GpuTensor,
     pub routed_mid: GpuTensor,
+    pub routed_down: GpuTensor,
     pub routed_out: GpuTensor,
     pub output_pre: GpuTensor,
     pub output_weights: GpuTensor,
@@ -84,7 +87,8 @@ impl GpuGraph {
             router_selected: alloc(N_EXPERT_USED as u64 * 4),
             router_weights: alloc(N_EXPERT_USED as u64 * 4),
             routed_gate: alloc(expert_bytes), routed_up: alloc(expert_bytes),
-            routed_mid: alloc(expert_bytes), routed_out: alloc(embd_bytes),
+            routed_mid: alloc(expert_bytes), routed_down: alloc(N_EXPERT_USED as u64 * N_EMBD as u64 * 4),
+            routed_out: alloc(embd_bytes),
             output_pre: alloc(N_HC as u64 * 4), output_weights: alloc(N_HC as u64 * 4),
             output_embd: alloc(embd_bytes), output_norm: alloc(embd_bytes),
             logits: alloc(N_VOCAB as u64 * 4),
@@ -190,10 +194,15 @@ pub fn eval_token_decode(
         // ─── Attention ───
         let n_raw_lim = graph.n_raw.min(graph.raw_cap);
         if n_raw_lim > 0 {
+            let sink_view = lw.attn_sinks.as_ref().and_then(|s|
+                views.find_view_retained(s.abs_offset, N_HEAD as u64 * 4));
+            let sinks: Option<(&ProtocolObject<dyn MTLBuffer>, u64)> =
+                sink_view.as_ref().map(|(buf, off)| (buf.as_ref(), *off));
             ops::indexed_attention(
                 &graph.heads, &graph.q,
                 &graph.raw_cache[il], &graph.index_comp[il],
-                &graph.index_comp[il], &graph.index_comp[il],
+                None,
+                sinks,
                 1, N_HEAD, n_raw_lim, graph.raw_cap,
                 graph.raw_start(), graph.n_comp[il], N_INDEXER_TOP_K, graph.n_pos,
                 N_SWA, if ratio == 4 { 4 } else { 1 },
@@ -267,37 +276,87 @@ pub fn eval_token_decode(
                 ops::router_select_one(&graph.router_probs,
                     bt.as_ref().unwrap_or(&graph.router_probs),
                     &graph.router_selected, N_EXPERT, bt.is_some())?;
-                ops::router_weights_one(&graph.router_probs,
-                    &graph.router_selected, &graph.router_weights)?;
             } else {
-                let mut d = vec![0u8; 24];
-                for (i, &s) in [0i32,1,2,3,4,5].iter().enumerate() { d[i*4..][..4].copy_from_slice(&s.to_le_bytes()); }
-                graph.router_selected.write_bytes(&d)?;
-                let mut wd = vec![0u8; 24];
-                wd[..4].copy_from_slice(&1.0f32.to_le_bytes());
-                graph.router_weights.write_bytes(&wd)?;
+                ops::router_select_one(&graph.router_probs, &graph.router_probs,
+                    &graph.router_selected, N_EXPERT, false)?;
             }
-            let sd = graph.router_selected.read_bytes()?;
-            let si = i32::from_le_bytes(sd[..4].try_into().unwrap()).max(0).min((N_EXPERT-1) as i32);
-            let fs = [si];
+            ops::router_weights_one(&graph.router_probs,
+                &graph.router_selected, &graph.router_weights)?;
+
+            // Read selected expert IDs from GPU
+            let mut sel_ids = vec![0i32; N_EXPERT_USED as usize];
+            graph.router_selected.read_i32_slice(0, &mut sel_ids)?;
+            for id in sel_ids.iter_mut() {
+                *id = (*id).max(0).min((N_EXPERT - 1) as i32);
+            }
+
             let eq = lw.ffn_gate_exps.as_ref().map(|t| t.dtype);
-            // Test: matmul_id only (skip swiglu + down)
-            if let (Some(qt), Some(gx), Some(ux), Some(_dx)) = (eq, &lw.ffn_gate_exps, &lw.ffn_up_exps, &lw.ffn_down_exps) {
+            if let (Some(qt), Some(gx), Some(ux), Some(dx)) =
+                (eq, &lw.ffn_gate_exps, &lw.ffn_up_exps, &lw.ffn_down_exps)
+            {
+                // Gate+up pair matmul for all selected experts
                 let r = match qt {
                     GgufTensorType::Iq2Xxs => ops::matmul_id_iq2_xxs_pair(
                         &graph.routed_gate, &graph.routed_up, views, gx.abs_offset, ux.abs_offset,
-                        N_EMBD, N_FF_EXP, N_EXPERT, &graph.ffn_norm, &fs),
+                        N_EMBD, N_FF_EXP, N_EXPERT, &graph.ffn_norm, &sel_ids),
                     GgufTensorType::Q2K => ops::matmul_id_q2_K_sum6(
                         &graph.routed_gate, &graph.routed_up, views, gx.abs_offset, ux.abs_offset,
-                        N_EMBD, N_FF_EXP, N_EXPERT, &graph.ffn_norm, &fs),
+                        N_EMBD, N_FF_EXP, N_EXPERT, &graph.ffn_norm, &sel_ids),
                     GgufTensorType::Q4K => ops::matmul_id_q4_K_sum6(
                         &graph.routed_gate, &graph.routed_up, views, gx.abs_offset, ux.abs_offset,
-                        N_EMBD, N_FF_EXP, N_EXPERT, &graph.ffn_norm, &fs),
+                        N_EMBD, N_FF_EXP, N_EXPERT, &graph.ffn_norm, &sel_ids),
                     _ => return Err("unsupported expert quant"),
                 };
                 r?;
+
+                // SwiGLU with router weights
+                ops::moe_swiglu_weight(&graph.routed_gate, &graph.routed_up,
+                    &graph.routed_mid, &graph.router_weights, N_FF_EXP, N_EXPERT_USED,
+                    DS4_SWIGLU_CLAMP_EXP)?;
+
+                // Down projection per expert + CPU accumulation
+                let down_type = dx.dtype;
+                let mut acc = vec![0.0f32; N_EMBD as usize];
+                for (i, &expert_id) in sel_ids.iter().enumerate() {
+                    let mid_row = GpuTensor::wrap(
+                        graph.routed_mid.retain_buf().unwrap(),
+                        graph.routed_mid.offset_raw() + (i as u64 * N_FF_EXP as u64 * 4),
+                        N_FF_EXP as u64 * 4);
+                    let r = match down_type {
+                        GgufTensorType::Iq2Xxs => ops::matmul_id_iq2_xxs_f32(
+                            &graph.routed_down, views, dx.abs_offset,
+                            N_FF_EXP, N_EMBD, N_EXPERT, &mid_row, &[expert_id]),
+                        GgufTensorType::Q2K => ops::matmul_id_q2_K_f32(
+                            &graph.routed_down, views, dx.abs_offset,
+                            N_FF_EXP, N_EMBD, N_EXPERT, &mid_row, &[expert_id]),
+                        GgufTensorType::Q4K => ops::matmul_id_q4_K_f32(
+                            &graph.routed_down, views, dx.abs_offset,
+                            N_FF_EXP, N_EMBD, N_EXPERT, &mid_row, &[expert_id]),
+                        GgufTensorType::Q8_0 => ops::matmul_id_q8_0_f32(
+                            &graph.routed_down, views, dx.abs_offset,
+                            N_FF_EXP, N_EMBD, N_EXPERT, &mid_row, &[expert_id]),
+                        _ => return Err("unsupported down expert quant"),
+                    };
+                    r?;
+                    // Read back down projection output and accumulate
+                    let down_bytes = graph.routed_down.read_bytes()?;
+                    let down_floats: &[f32] = unsafe {
+                        std::slice::from_raw_parts(
+                            down_bytes.as_ptr() as *const f32, N_EMBD as usize)
+                    };
+                    for j in 0..N_EMBD as usize { acc[j] += down_floats[j]; }
+                }
+
+                // Write accumulated routed expert output
+                let acc_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        acc.as_ptr() as *const u8, acc.len() * 4)
+                };
+                graph.routed_out.write_bytes(acc_bytes)?;
+            } else {
+                graph.routed_out.fill_f32(0.0, N_EMBD as u64)?;
             }
-            // Routed MoE: bypass down (NaN from matmul_id_*_pair gate/up values)
+        } else {
             graph.routed_out.fill_f32(0.0, N_EMBD as u64)?;
         }
 
@@ -376,7 +435,7 @@ pub fn save_snapshot(graph: &GpuGraph) -> Result<Vec<u8>, &'static str> {
         &graph.shared_gate, &graph.shared_up, &graph.shared_mid, &graph.shared_out,
         &graph.router_logits, &graph.router_probs,
         &graph.router_selected, &graph.router_weights,
-        &graph.routed_gate, &graph.routed_up, &graph.routed_mid, &graph.routed_out,
+        &graph.routed_gate, &graph.routed_up, &graph.routed_mid, &graph.routed_down, &graph.routed_out,
         &graph.output_pre, &graph.output_weights, &graph.output_embd,
         &graph.output_norm, &graph.logits] {
         let d = t.read_bytes()?;
@@ -408,7 +467,7 @@ pub fn load_snapshot(graph: &mut GpuGraph, data: &[u8]) -> Result<(), &'static s
         &mut graph.shared_gate, &mut graph.shared_up, &mut graph.shared_mid, &mut graph.shared_out,
         &mut graph.router_logits, &mut graph.router_probs,
         &mut graph.router_selected, &mut graph.router_weights,
-        &mut graph.routed_gate, &mut graph.routed_up, &mut graph.routed_mid, &mut graph.routed_out,
+        &mut graph.routed_gate, &mut graph.routed_up, &mut graph.routed_mid, &mut graph.routed_down, &mut graph.routed_out,
         &mut graph.output_pre, &mut graph.output_weights, &mut graph.output_embd,
         &mut graph.output_norm, &mut graph.logits] {
         r(&mut b4)?; let sz = u32::from_le_bytes(b4) as usize;

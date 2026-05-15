@@ -913,10 +913,11 @@ pub fn kv_fp8_store(
     let args = KvFp8StoreArgs {
         head_dim: head_dim as i32, n_rot: n_rot as i32, raw_row: raw_row as i32,
     };
-    dispatch_pipeline("kernel_dsv4_kv_fp8_store_f32", &args,
+    dispatch_pipeline_tg("kernel_dsv4_kv_fp8_store_f32", &args,
         &[(kv.buf_ref(), kv.offset_raw()),
           (raw_cache.buf_ref(), raw_cache.offset_raw())],
-        (1, 1, 1), (64, 1, 1))
+        (1, 1, 1), (64, 1, 1),
+        256) // 64 * sizeof(float) scratch for FP8 reduction
 }
 
 // ─── Compressor Store One ───────────────────────────────────────────────
@@ -988,13 +989,14 @@ pub fn router_select_one(
     let zero = unsafe {
         device.newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared)
     }.ok_or("zero buffer")?;
-    dispatch_pipeline("kernel_dsv4_router_finalize_one", &args,
+    dispatch_pipeline_tg("kernel_dsv4_router_finalize_one", &args,
         &[(probs.buf_ref(), probs.offset_raw()),
           (bias.buf_ref(), bias.offset_raw()),
           (Some(&*zero), 0),
           (Some(&*zero), 0),
           (selected.buf_ref(), selected.offset_raw())],
-        (1, 1, 1), (256, 1, 1))
+        (1, 1, 1), (256, 1, 1),
+        2048) // 256*sizeof(float) + 256*sizeof(int32_t)
 }
 
 pub fn router_weights_one(
@@ -1013,22 +1015,22 @@ pub fn router_weights_one(
 
 pub fn moe_swiglu_weight(
     gate: &GpuTensor, up: &GpuTensor, mid: &GpuTensor,
-    weights: &GpuTensor, width: u32,
+    weights: &GpuTensor, width: u32, n_experts: u32, clamp: f32,
 ) -> Result<(), &'static str> {
     let args = MoeSwigluWeightArgs {
-        width, rows: 1,
+        width, rows: n_experts,
         gate_row_stride: width as u64 * 4,
         up_row_stride: width as u64 * 4,
         mid_row_stride: width as u64 * 4,
         weight_stride: 4,
-        write_clamped: 0, clamp_value: 0.0,
+        write_clamped: 0, clamp_value: clamp,
     };
     dispatch_pipeline("kernel_dsv4_moe_swiglu_weight", &args,
         &[(gate.buf_ref(), gate.offset_raw()),
           (up.buf_ref(), up.offset_raw()),
           (mid.buf_ref(), mid.offset_raw()),
           (weights.buf_ref(), weights.offset_raw())],
-        (1, 1, 1), (256, 1, 1))
+        (n_experts as usize, 1, 1), (256, 1, 1))
 }
 
 // ─── Indexed mixed attention ────────────────────────────────────────────
@@ -1036,7 +1038,8 @@ pub fn moe_swiglu_weight(
 pub fn indexed_attention(
     heads: &GpuTensor, q: &GpuTensor,
     raw_kv: &GpuTensor, comp_kv: &GpuTensor,
-    topk: &GpuTensor, sinks: &GpuTensor,
+    topk: Option<&GpuTensor>,
+    sinks: Option<(&ProtocolObject<dyn MTLBuffer>, u64)>,
     n_tokens: u32, n_head: u32, n_raw: u32, raw_cap: u32,
     raw_start: u32, n_comp: u32, topk_k: u32, pos0: u32,
     window: u32, ratio: u32, scale: f32,
@@ -1055,21 +1058,23 @@ pub fn indexed_attention(
         scale,
     };
     let device = bridge::device().ok_or("no device")?;
-    let _dummy: Option<Retained<ProtocolObject<dyn MTLBuffer>>> = if sinks.buf_ref().is_none() {
-        Some(unsafe {
-            device.newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared)
-        }.ok_or("dummy buffer")?)
+    let dummy_buf;
+    let (sink_ref, sink_off) = if let Some((buf, off)) = sinks {
+        (buf, off)
     } else {
-        None
+        dummy_buf = unsafe {
+            device.newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared)
+        }.ok_or("dummy buffer")?;
+        (&*dummy_buf, 0)
     };
-    let sink_ref = sinks.buf_ref().or(_dummy.as_deref());
+    let (topk_buf, topk_off) = topk.map_or((None, 0), |t| (t.buf_ref(), t.offset_raw()));
     // kernel uses threadgroup float4 *kv_shared[128] = 2048 bytes
     dispatch_pipeline_tg("kernel_dsv4_indexed_mixed_attention_heads8", &args,
         &[(q.buf_ref(), q.offset_raw()),
           (raw_kv.buf_ref(), raw_kv.offset_raw()),
           (comp_kv.buf_ref(), comp_kv.offset_raw()),
-          (topk.buf_ref(), topk.offset_raw()),
-          (sink_ref, 0),
+          (topk_buf, topk_off),
+          (Some(sink_ref), sink_off),
           (heads.buf_ref(), heads.offset_raw())],
         (n_tokens as usize, (n_head / 8 + 1) as usize, 1), (128, 1, 1),
         2048) // 128 * sizeof(float4)
