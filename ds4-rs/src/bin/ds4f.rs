@@ -131,9 +131,8 @@ fn init_metal() {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|b| b as f64 / (1024.0 * 1024.0 * 1024.0))
         .unwrap_or(0.0);
-    ds4_rs::bridge::with_device(|d| {
-        eprintln!("ds4: Metal device {}, {:.2} GiB RAM", d.name(), ram_gib);
-    });
+    let device_name = ds4_rs::bridge::device_name();
+    eprintln!("ds4: Metal device {}, {:.2} GiB RAM", device_name, ram_gib);
 }
 
 fn load_model(model_path: &str, ctx_size: u32, quiet: bool) -> ds4_rs::session::SessionState {
@@ -231,13 +230,12 @@ fn run_one_shot(mut sess: ds4_rs::session::SessionState, opts: &RunArgs, prompt:
     // Time generation separately, stream tokens as they are produced
     let t_gen_start = std::time::Instant::now();
     let mut result_tokens = Vec::new();
+    let mut dbg_count = 0usize;
     for _ in 0..opts.n_predict {
-        let token = if opts.temperature < 0.01 {
-            sess.argmax().0
-        } else {
-            sess.sample(opts.temperature, opts.top_k)
-        };
-        if sess.is_stop_token(token) { break; }
+        let (token, score) = sess.argmax();
+        let token = if opts.temperature < 0.01 { token } else { sess.sample(opts.temperature, opts.top_k) };
+        if dbg_count < 5 { eprintln!("ds4 [DBG] gen token={} score={:.4}", token, score); dbg_count += 1; }
+        if sess.is_stop_token(token) { eprintln!("ds4 [DBG] stop token {}", token); break; }
         result_tokens.push(token);
         if let Some(ref vocab) = sess.vocab {
             let txt = ds4_rs::tokenizer::token_decode(vocab, &[token]);

@@ -6,6 +6,7 @@ use crate::weights;
 use crate::tokenizer;
 use std::sync::{Arc, Mutex};
 use memmap2::Mmap;
+use objc2_metal::MTLBuffer;
 
 pub static SESSION: std::sync::OnceLock<Mutex<SessionState>> = std::sync::OnceLock::new();
 
@@ -73,12 +74,12 @@ impl SessionState {
             }
             self.checkpoint.truncate(common);
         } else {
-            if let (Some(ref w), Some(ref v), Some(ref m)) =
-                (&self.weights, &self.model_views, &self.model_map)
+            if let (Some(ref w), Some(ref v)) =
+                (&self.weights, &self.model_views)
             {
                 let mut g = GpuGraph::allocate(65536)?;
                 let short = &prompt[..common.min(prompt.len())];
-                eval_prefill(&mut g, short, w, v, m, self.model_size)?;
+                eval_prefill(&mut g, short, w, v)?;
                 self.graph = Some(g);
             }
             self.checkpoint.clear();
@@ -88,10 +89,10 @@ impl SessionState {
     }
 
     pub fn prefill(&mut self, tokens: &[i32]) -> Result<(), &'static str> {
-        if let (Some(ref mut graph), Some(ref weights), Some(ref views), Some(ref map)) =
-            (&mut self.graph, &self.weights, &self.model_views, &self.model_map)
+        if let (Some(ref mut graph), Some(ref weights), Some(ref views)) =
+            (&mut self.graph, &self.weights, &self.model_views)
         {
-            eval_prefill(graph, tokens, weights, views, map, self.model_size)?;
+            eval_prefill(graph, tokens, weights, views)?;
             self.n_pos = graph.n_pos;
         } else {
             self.n_pos += tokens.len() as u32;
@@ -101,10 +102,10 @@ impl SessionState {
     }
 
     pub fn decode(&mut self, token: i32) -> Result<(), &'static str> {
-        if let (Some(ref mut graph), Some(ref weights), Some(ref views), Some(ref map)) =
-            (&mut self.graph, &self.weights, &self.model_views, &self.model_map)
+        if let (Some(ref mut graph), Some(ref weights), Some(ref views)) =
+            (&mut self.graph, &self.weights, &self.model_views)
         {
-            eval_token_decode(graph, token, weights, views, map, self.model_size)?;
+            eval_token_decode(graph, token, weights, views)?;
         }
         self.checkpoint.push(token);
         self.n_pos += 1;
@@ -113,8 +114,8 @@ impl SessionState {
 
     pub fn get_logits(&self) -> &[f32] {
         if let Some(ref graph) = self.graph {
-            if let Some(ref buf) = graph.logits.buffer() {
-                let ptr = buf.contents() as *const f32;
+            if let Some(buf) = graph.logits.buf_ref() {
+                let ptr = buf.contents().as_ptr() as *const f32;
                 let n = N_VOCAB as usize;
                 return unsafe { std::slice::from_raw_parts(ptr, n) };
             }

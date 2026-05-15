@@ -102,25 +102,16 @@ fn is_hash_layer(il: u32) -> bool {
     il < N_HASH_LAYER
 }
 
-fn model_buf(model_map: &[u8], offset: u64, bytes: u64) -> metal::Buffer {
-    let device = crate::bridge::with_device(|d| d.clone()).unwrap();
-    let data = &model_map[offset as usize..][..bytes as usize];
-    device.new_buffer_with_data(
-        data.as_ptr() as *const std::ffi::c_void, bytes,
-        metal::MTLResourceOptions::StorageModeShared)
-}
-
 pub fn eval_token_decode(
     graph: &mut GpuGraph, token: i32,
-    weights: &EngineWeights, _views: &ModelViews,
-    model_map: &[u8], _model_size: u64,
+    weights: &EngineWeights, views: &ModelViews,
 ) -> Result<(), &'static str> {
     let pos = graph.n_pos;
     let n = graph.n_layer;
 
     // Embed token → repeat across HC channels
     if let Some(ref emb) = weights.token_embd {
-        ops::embed_tokens(&graph.hc_mix[0], model_map, _model_size,
+        ops::embed_tokens(&graph.hc_mix[0], views,
             emb.abs_offset, N_VOCAB, N_EMBD, &[token])?;
         // Repeat across 4 HC channels and all layers
         for il in 0..n {
@@ -139,7 +130,6 @@ pub fn eval_token_decode(
         // ─── HC pre-attention ───
         if lw.hc_attn_fn.is_some() {
             ops::hc_split_sinkhorn(&graph.hc_split[il], &graph.hc_mix[il],
-                model_map, _model_size, 0, 0,
                 N_HC, N_HC_SINKHORN_ITER, DS4_HC_EPS)?;
             ops::hc_weighted_sum(&graph.cur[il], &graph.hc_mix[il],
                 &graph.hc_split[il], N_EMBD, N_HC)?;
@@ -151,12 +141,12 @@ pub fn eval_token_decode(
 
         // ─── Q projection ───
         if let (Some(qa), Some(qb)) = (&lw.attn_q_a, &lw.attn_q_b) {
-            ops::matmul_f16(&graph.q_after_norm[il], model_map, _model_size,
+            ops::matmul_f16(&graph.q_after_norm[il], views,
                 qa.abs_offset, N_EMBD as u64, N_LORA_Q as u64,
                 &graph.cur[il], 1)?;
             ops::rms_norm_plain(&graph.q_after_norm[il], &graph.q_after_norm[il],
                 N_LORA_Q, DS4_RMS_EPS)?;
-            ops::matmul_f16(&graph.q[il], model_map, _model_size,
+            ops::matmul_f16(&graph.q[il], views,
                 qb.abs_offset, N_LORA_Q as u64,
                 (N_HEAD * N_HEAD_DIM) as u64,
                 &graph.q_after_norm[il], 1)?;
@@ -164,10 +154,10 @@ pub fn eval_token_decode(
 
         // ─── KV projection ───
         if let (Some(kva), Some(kvb)) = (&lw.attn_kv_a, &lw.attn_kv_b) {
-            ops::matmul_f16(&graph.kv[il], model_map, _model_size,
+            ops::matmul_f16(&graph.kv[il], views,
                 kva.abs_offset, N_EMBD as u64, N_LORA_Q as u64,
                 &graph.cur[il], 1)?;
-            ops::matmul_f16(&graph.kv[il], model_map, _model_size,
+            ops::matmul_f16(&graph.kv[il], views,
                 kvb.abs_offset, N_LORA_Q as u64, N_HEAD_DIM as u64,
                 &graph.kv[il], 1)?;
         }
@@ -197,7 +187,7 @@ pub fn eval_token_decode(
                 // score = dot_product between KV rows (simplified with 0)
                 ops::compressor_store_one(
                     &graph.kv[il], &graph.kv[il],
-                    model_map, ape.abs_offset,
+                    views, ape.abs_offset,
                     &graph.state_kv[il], &graph.state_score[il],
                     N_HEAD_DIM, ratio, pos,
                 )?;
@@ -223,12 +213,12 @@ pub fn eval_token_decode(
         if is_indexed && graph.n_comp[il] > 0 {
             if let Some(iw) = &lw.indexer_attn_q_b {
                 let q_idx = &graph.cur[il]; // reuse cur indexer-dim Q
-                ops::matmul_f16(q_idx, model_map, _model_size,
+                ops::matmul_f16(q_idx, views,
                     iw.abs_offset, (N_HEAD * N_HEAD_DIM) as u64,
                     (N_INDEXER_HEAD * N_INDEXER_HEAD_DIM) as u64,
                     &graph.q[il], 1)?;
                 ops::indexer_score_one(
-                    &graph.logits, q_idx, model_map,
+                    &graph.logits, q_idx, views,
                     lw.indexer_proj.as_ref().map_or(0, |t| t.abs_offset),
                     &graph.index_comp[il],
                     graph.n_comp[il], N_INDEXER_HEAD, N_INDEXER_HEAD_DIM,
@@ -255,7 +245,7 @@ pub fn eval_token_decode(
 
         // ─── Attention output ───
         if let Some(oa) = &lw.attn_output_a {
-            ops::matmul_q8_0(&graph.attn_out[il], model_map, _model_size,
+            ops::matmul_q8_0(&graph.attn_out[il], views,
                 oa.abs_offset, (N_HEAD * N_HEAD_DIM) as u64, N_EMBD as u64,
                 &graph.heads[il], 1)?;
         }
@@ -268,7 +258,6 @@ pub fn eval_token_decode(
         // ─── RMS norm before FFN ───
         if lw.hc_ffn_fn.is_some() {
             ops::hc_split_sinkhorn(&graph.hc_split[il], &graph.hc_mix[il],
-                model_map, _model_size, 0, 0,
                 N_HC, N_HC_SINKHORN_ITER, DS4_HC_EPS)?;
             ops::hc_weighted_sum(&graph.cur[il], &graph.hc_mix[il],
                 &graph.hc_split[il], N_EMBD, N_HC)?;
@@ -280,15 +269,15 @@ pub fn eval_token_decode(
         if let (Some(sg), Some(su), Some(sd)) =
             (&lw.shared_gate, &lw.shared_up, &lw.shared_down)
         {
-            ops::matmul_q8_0(&graph.shared_mid[il], model_map, _model_size,
+            ops::matmul_q8_0(&graph.shared_mid[il], views,
                 sg.abs_offset, N_EMBD as u64, N_FF_EXP as u64,
                 &graph.cur[il], 1)?;
-            ops::matmul_q8_0(&graph.routed_out[il], model_map, _model_size,
+            ops::matmul_q8_0(&graph.routed_out[il], views,
                 su.abs_offset, N_EMBD as u64, N_FF_EXP as u64,
                 &graph.cur[il], 1)?;
             ops::swiglu(&graph.shared_mid[il], &graph.shared_mid[il],
                 &graph.routed_out[il], N_FF_EXP, 10.0, 1.5)?;
-            ops::matmul_q8_0(&graph.attn_out[il], model_map, _model_size,
+            ops::matmul_q8_0(&graph.attn_out[il], views,
                 sd.abs_offset, N_FF_EXP as u64, N_EMBD as u64,
                 &graph.shared_mid[il], 1)?;
         }
@@ -296,7 +285,7 @@ pub fn eval_token_decode(
         // ─── MoE Router: ffn_gate_inp → softplus+sqrt → top-k select → weights ───
         if let Some(gi) = &lw.ffn_gate_inp {
             // Router logits
-            ops::matmul_f16(&graph.router_logits[il], model_map, _model_size,
+            ops::matmul_f16(&graph.router_logits[il], views,
                 gi.abs_offset, N_EMBD as u64, N_EXPERT as u64,
                 &graph.cur[il], 1)?;
             // Softplus + sqrt → probabilities
@@ -306,11 +295,9 @@ pub fn eval_token_decode(
             if is_hash_layer(il as u32) {
                 // Hash routing: tids[token_id] → selected experts
                 // Router: top-k select via router_finalize_one
-                let bias_buf = lw.ffn_exp_probs_b.as_ref().map(|b| {
-                    model_buf(model_map, b.abs_offset, 256 * 4)
-                });
-                let bias_tensor = bias_buf.as_ref().map(|b| {
-                    crate::tensor::GpuTensor::wrap(b.clone(), 0, 256 * 4)
+                let bias_tensor = lw.ffn_exp_probs_b.as_ref().and_then(|b| {
+                    let (buf, off) = views.find_view_retained(b.abs_offset, 256 * 4)?;
+                    Some(crate::tensor::GpuTensor::wrap(buf, off, 256 * 4))
                 });
                 let selected = &graph.router_selected[il];
                 let probs = &graph.router_probs[il];
@@ -335,19 +322,19 @@ pub fn eval_token_decode(
             let result = match qt {
                 GgufTensorType::Iq2Xxs => ops::matmul_id_iq2_xxs_pair(
                     &graph.expert_gate[il], &graph.expert_up[il],
-                    model_map, gexp.abs_offset, uexp.abs_offset,
+                    views, gexp.abs_offset, uexp.abs_offset,
                     N_EMBD, N_FF_EXP, N_EXPERT,
                     &graph.cur[il], &sel_ids,
                 ),
                 GgufTensorType::Q2K => ops::matmul_id_q2_K_sum6(
                     &graph.expert_gate[il], &graph.expert_up[il],
-                    model_map, gexp.abs_offset, uexp.abs_offset,
+                    views, gexp.abs_offset, uexp.abs_offset,
                     N_EMBD, N_FF_EXP, N_EXPERT,
                     &graph.cur[il], &sel_ids,
                 ),
                 GgufTensorType::Q4K => ops::matmul_id_q4_K_sum6(
                     &graph.expert_gate[il], &graph.expert_up[il],
-                    model_map, gexp.abs_offset, uexp.abs_offset,
+                    views, gexp.abs_offset, uexp.abs_offset,
                     N_EMBD, N_FF_EXP, N_EXPERT,
                     &graph.cur[il], &sel_ids,
                 ),
@@ -361,7 +348,7 @@ pub fn eval_token_decode(
                 N_FF_EXP,
             )?;
             // Down projection
-            ops::matmul_q8_0(&graph.cur[il], model_map, _model_size,
+            ops::matmul_q8_0(&graph.cur[il], views,
                 dexp.abs_offset, N_FF_EXP as u64, N_EMBD as u64,
                 &graph.expert_mid[il], 1)?;
         }
@@ -383,7 +370,7 @@ pub fn eval_token_decode(
         let last = n - 1;
         ops::rms_norm_plain(&graph.attn_out[last], &graph.attn_out[last],
             N_EMBD, DS4_RMS_EPS)?;
-        ops::matmul_q8_0(&graph.logits, model_map, _model_size,
+        ops::matmul_q8_0(&graph.logits, views,
             ow.abs_offset, N_EMBD as u64, N_VOCAB as u64,
             &graph.attn_out[last], 1)?;
     }
@@ -467,10 +454,9 @@ pub fn load_snapshot(graph: &mut GpuGraph, data: &[u8]) -> Result<(), &'static s
 pub fn eval_prefill(
     graph: &mut GpuGraph, tokens: &[i32],
     weights: &EngineWeights, views: &ModelViews,
-    model_map: &[u8], model_size: u64,
 ) -> Result<(), &'static str> {
     for &token in tokens {
-        eval_token_decode(graph, token, weights, views, model_map, model_size)?;
+        eval_token_decode(graph, token, weights, views)?;
     }
     Ok(())
 }

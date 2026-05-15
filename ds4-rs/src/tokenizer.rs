@@ -101,10 +101,11 @@ pub fn vocab_load(model: &GgufModel) -> Vocab {
     };
 
     if let Some(data) = model.find_kv("tokenizer.ggml.tokens") {
-        let mut i = 0usize;
-        while i + 4 <= data.len() {
-            let len = u32::from_le_bytes(data[i..i+4].try_into().unwrap_or([0;4])) as usize;
-            i += 4;
+        // GGUF array: [item_type(4) | count(8) | ...items...]; strings: [len(8) | bytes]
+        let mut i = 12usize; // skip array header
+        while i + 8 <= data.len() {
+            let len = u64::from_le_bytes(data[i..i+8].try_into().unwrap_or([0;8])) as usize;
+            i += 8;
             if i + len <= data.len() {
                 v.tokens.push(String::from_utf8_lossy(&data[i..i+len]).to_string());
                 i += len;
@@ -113,30 +114,37 @@ pub fn vocab_load(model: &GgufModel) -> Vocab {
     }
 
     if let Some(data) = model.find_kv("tokenizer.ggml.scores") {
-        for j in 0..data.len() / 4 {
-            if j * 4 + 4 <= data.len() {
-                v.scores.push(f32::from_le_bytes(data[j*4..j*4+4].try_into().unwrap_or([0;4])));
-            }
+        // GGUF array: [item_type(4) | count(8) | f32...]; skip 12-byte header
+        let mut i = 12usize;
+        while i + 4 <= data.len() {
+            v.scores.push(f32::from_le_bytes(data[i..i+4].try_into().unwrap_or([0;4])));
+            i += 4;
         }
     }
 
     // Load BPE merges
+    // GGUF array of strings: [item_type(4) | count(8) | ...]; each item: [len(8) | bytes]
+    // Each merge string is "piece_a piece_b" – look up IDs by string (not integer parse).
     if let Some(data) = model.find_kv("tokenizer.ggml.merges") {
-        // Format: array of strings: length-prefixed merge pairs "a b"
-        let mut i = 0usize;
-        while i + 4 <= data.len() {
-            let slen = u32::from_le_bytes(data[i..i+4].try_into().unwrap_or([0;4])) as usize;
-            i += 4;
+        let token_map: HashMap<String, i32> = v.tokens.iter().enumerate()
+            .map(|(i, t)| (t.clone(), i as i32)).collect();
+        let mut i = 12usize; // skip array header
+        while i + 8 <= data.len() {
+            let slen = u64::from_le_bytes(data[i..i+8].try_into().unwrap_or([0;8])) as usize;
+            i += 8;
             if i + slen <= data.len() {
                 let s = String::from_utf8_lossy(&data[i..i+slen]).to_string();
-                if let Some(space) = s.find(' ') {
-                    let a: i32 = s[..space].parse().unwrap_or(0);
-                    let b: i32 = s[space+1..].trim().parse().unwrap_or(0);
-                    v.merges.push((a, b));
+                if let Some(sp) = s.find(' ') {
+                    let a_str = &s[..sp];
+                    let b_str = s[sp+1..].trim_end();
+                    if let (Some(&a), Some(&b)) = (token_map.get(a_str), token_map.get(b_str)) {
+                        v.merges.push((a, b));
+                    }
                 }
                 i += slen;
             } else { break; }
         }
+        eprintln!("ds4: loaded {} BPE merges", v.merges.len());
     }
 
     if let Some(data) = model.find_kv("tokenizer.ggml.bos_token_id") {
@@ -290,19 +298,70 @@ fn bpe_encode_piece(vocab: &Vocab, text: &[u8], ranks: &HashMap<String, i32>) ->
     out
 }
 
-pub fn bpe_tokenize(vocab: &Vocab, text: &str) -> Vec<i32> {
-    let mut out = Vec::new();
-    out.push(vocab.bos_id);
+// Returns true for tokens that must be matched verbatim (DeepSeek special tokens,
+// angle-bracket tags like <think> / </think>, etc.).
+fn is_special_token(t: &str) -> bool {
+    // Full-width vertical bar ｜ = U+FF5C — used in <｜begin▁of▁sentence｜> etc.
+    if t.contains('<') && (t.contains('\u{FF5C}') || t.ends_with('>')) && t.len() > 2 {
+        return true;
+    }
+    false
+}
 
-    let pieces = joyai_pre_tokenize(text);
+pub fn bpe_tokenize(vocab: &Vocab, text: &str) -> Vec<i32> {
     let ranks = build_merge_ranks(vocab);
 
-    for piece in &pieces {
-        let tokens = bpe_encode_piece(vocab, piece.as_bytes(), &ranks);
-        out.extend(tokens);
+    // Collect special tokens sorted longest-first for greedy left-to-right matching.
+    let mut special: Vec<(&str, i32)> = vocab.tokens.iter().enumerate()
+        .filter(|(_, t)| is_special_token(t))
+        .map(|(i, t)| (t.as_str(), i as i32))
+        .collect();
+    special.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    let text_bytes = text.as_bytes();
+    let tlen = text_bytes.len();
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+
+    while pos < tlen {
+        // 1. Try to match a special token verbatim.
+        let mut matched = false;
+        for &(sp, sp_id) in &special {
+            let sb = sp.as_bytes();
+            if text_bytes[pos..].starts_with(sb) {
+                out.push(sp_id);
+                pos += sb.len();
+                matched = true;
+                break;
+            }
+        }
+        if matched { continue; }
+
+        // 2. Collect the next run of non-special text.
+        let seg_start = pos;
+        let mut seg_end = pos;
+        'advance: while seg_end < tlen {
+            for &(sp, _) in &special {
+                if text_bytes[seg_end..].starts_with(sp.as_bytes()) {
+                    break 'advance;
+                }
+            }
+            let skip = utf8_len(text_bytes[seg_end]).min(tlen - seg_end).max(1);
+            seg_end += skip;
+        }
+
+        if seg_end > seg_start {
+            let segment = match std::str::from_utf8(&text_bytes[seg_start..seg_end]) {
+                Ok(s) => s,
+                Err(_) => { pos = seg_end; continue; }
+            };
+            for piece in &joyai_pre_tokenize(segment) {
+                out.extend(bpe_encode_piece(vocab, piece.as_bytes(), &ranks));
+            }
+        }
+        pos = seg_end;
     }
 
-    out.push(vocab.eos_id);
     out
 }
 

@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLResourceOptions};
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::bridge;
 

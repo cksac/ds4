@@ -39,7 +39,7 @@ impl ModelViews {
         let device = bridge::device().ok_or("no Metal device")?;
         let mmap = model.map.clone();
 
-        let page = unsafe { libc::getpagesize() } as u64;
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         let mmap_ptr = mmap.as_ptr() as usize;
 
         // Verify the mmap base is page-aligned (always true for mmap).
