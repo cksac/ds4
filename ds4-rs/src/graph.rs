@@ -324,38 +324,48 @@ pub fn eval_token_decode(
                     &graph.routed_mid, &graph.router_weights, N_FF_EXP, N_EXPERT_USED,
                     DS4_SWIGLU_CLAMP_EXP)?;
 
-                // Down projection per expert + CPU accumulation
+                // Down projection: batch all 6 experts to different rows, then read once
                 let down_type = dx.dtype;
                 let mut acc = vec![0.0f32; N_EMBD as usize];
+                // Dispatch all 6 down projections into the batch (no per-expert flush)
                 for (i, &expert_id) in sel_ids.iter().enumerate() {
                     let mid_row = GpuTensor::wrap(
                         graph.routed_mid.retain_buf().unwrap(),
                         graph.routed_mid.offset_raw() + (i as u64 * N_FF_EXP as u64 * 4),
                         N_FF_EXP as u64 * 4);
+                    let down_row = GpuTensor::wrap(
+                        graph.routed_down.retain_buf().unwrap(),
+                        graph.routed_down.offset_raw() + (i as u64 * N_EMBD as u64 * 4),
+                        N_EMBD as u64 * 4);
                     let r = match down_type {
                         GgufTensorType::Iq2Xxs => ops::matmul_id_iq2_xxs_f32(
-                            &graph.routed_down, views, dx.abs_offset,
+                            &down_row, views, dx.abs_offset,
                             N_FF_EXP, N_EMBD, N_EXPERT, &mid_row, &[expert_id]),
                         GgufTensorType::Q2K => ops::matmul_id_q2_K_f32(
-                            &graph.routed_down, views, dx.abs_offset,
+                            &down_row, views, dx.abs_offset,
                             N_FF_EXP, N_EMBD, N_EXPERT, &mid_row, &[expert_id]),
                         GgufTensorType::Q4K => ops::matmul_id_q4_K_f32(
-                            &graph.routed_down, views, dx.abs_offset,
+                            &down_row, views, dx.abs_offset,
                             N_FF_EXP, N_EMBD, N_EXPERT, &mid_row, &[expert_id]),
                         GgufTensorType::Q8_0 => ops::matmul_id_q8_0_f32(
-                            &graph.routed_down, views, dx.abs_offset,
+                            &down_row, views, dx.abs_offset,
                             N_FF_EXP, N_EMBD, N_EXPERT, &mid_row, &[expert_id]),
                         _ => return Err("unsupported down expert quant"),
                     };
                     r?;
-                    // Read back down projection output and accumulate
-                    ops::flush_batch()?;
-                    let down_bytes = graph.routed_down.read_bytes()?;
-                    let down_floats: &[f32] = unsafe {
-                        std::slice::from_raw_parts(
-                            down_bytes.as_ptr() as *const f32, N_EMBD as usize)
+                }
+                // Read back 6 rows from routed_down and accumulate
+                {
+                    let data = graph.routed_down.read_bytes()?;
+                    let floats: &[f32] = unsafe {
+                        std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len()/4)
                     };
-                    for j in 0..N_EMBD as usize { acc[j] += down_floats[j]; }
+                    for i in 0..N_EXPERT_USED as usize {
+                        let row_start = i * N_EMBD as usize;
+                        for j in 0..N_EMBD as usize {
+                            acc[j] += floats[row_start + j];
+                        }
+                    }
                 }
 
                 // Write accumulated routed expert output
@@ -401,6 +411,7 @@ pub fn eval_token_decode(
             ohc_fn.abs_offset, hc_dim as u64, N_HC as u64, &graph.flat_hc, 1)?;
     }
     if let (Some(ref scale), Some(ref base)) = (&weights.output_hc_scale, &weights.output_hc_base) {
+        ops::flush_batch()?; // commit pending work so output_pre is valid
         ops::output_hc_weights(&graph.output_weights, &graph.output_pre,
             views, scale.abs_offset, base.abs_offset, N_HC, DS4_HC_EPS)?;
     }

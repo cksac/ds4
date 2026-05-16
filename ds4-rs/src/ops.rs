@@ -41,8 +41,15 @@ pub fn end_batch() -> Result<(), &'static str> {
         cb.0.commit();
         drop(state);
         cb.0.waitUntilCompleted();
-        if cb.0.status() == objc2_metal::MTLCommandBufferStatus::Error {
-            return Err("gpu kernel failed");
+        let status = cb.0.status();
+        if status == objc2_metal::MTLCommandBufferStatus::Error {
+            if let Some(err) = cb.0.error() {
+                eprintln!("ds4: Metal batch error: {:?}", err);
+            }
+            return Err("gpu batch failed");
+        }
+        if status != objc2_metal::MTLCommandBufferStatus::Completed {
+            eprintln!("ds4: Metal batch status={:?}", status);
         }
     }
     Ok(())
