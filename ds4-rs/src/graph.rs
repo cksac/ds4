@@ -119,6 +119,13 @@ const DS4_SWIGLU_CLAMP_EXP: f32 = 10.0;
 fn compress_ratio(il: u32) -> u32 { if il < 2 { 0 } else if (il & 1) == 0 { 4 } else { 128 } }
 fn is_hash_layer(il: u32) -> bool { il < N_HASH_LAYER }
 
+struct BatchGuard;
+impl Drop for BatchGuard {
+    fn drop(&mut self) {
+        let _ = ops::end_batch();
+    }
+}
+
 pub fn eval_token_decode(
     graph: &mut GpuGraph, token: i32,
     weights: &EngineWeights, views: &ModelViews,
@@ -126,13 +133,14 @@ pub fn eval_token_decode(
     let hc_dim = N_HC * N_EMBD;
     let mix_hc = (2 * N_HC + N_HC * N_HC) as u64;
 
+    ops::begin_batch()?;
+    let _guard = BatchGuard;
     if let Some(ref emb) = weights.token_embd {
         ops::embed_tokens(&graph.flat_hc, views,
             emb.abs_offset, N_VOCAB, N_EMBD, &[token])?;
         ops::repeat_f32(&graph.cur_hc, &graph.flat_hc,
             (N_EMBD * N_HC) as i32, 1, N_EMBD as i32, 1)?;
     }
-
     for il in 0..graph.n_layer {
         let lw = &weights.layer[il];
         let ratio = compress_ratio(il as u32);
@@ -155,6 +163,7 @@ pub fn eval_token_decode(
             ops::rms_norm_weight(&graph.attn_norm, &graph.attn_cur,
                 views, norm_w.abs_offset, N_EMBD, DS4_RMS_EPS)?;
         }
+
 
         // ─── Q projection ───
         if let (Some(ref qa), Some(ref qb)) = (&lw.attn_q_a, &lw.attn_q_b) {
@@ -284,6 +293,7 @@ pub fn eval_token_decode(
                 &graph.router_selected, &graph.router_weights)?;
 
             // Read selected expert IDs from GPU
+            ops::flush_batch()?;
             let mut sel_ids = vec![0i32; N_EXPERT_USED as usize];
             graph.router_selected.read_i32_slice(0, &mut sel_ids)?;
             for id in sel_ids.iter_mut() {
@@ -339,6 +349,7 @@ pub fn eval_token_decode(
                     };
                     r?;
                     // Read back down projection output and accumulate
+                    ops::flush_batch()?;
                     let down_bytes = graph.routed_down.read_bytes()?;
                     let down_floats: &[f32] = unsafe {
                         std::slice::from_raw_parts(
@@ -403,7 +414,6 @@ pub fn eval_token_decode(
         ops::matmul_q8_0(&graph.logits, views,
             ow.abs_offset, N_EMBD as u64, N_VOCAB as u64, &graph.output_norm, 1)?;
     }
-
     graph.n_raw = (graph.n_raw + 1).min(graph.raw_cap);
     graph.n_pos += 1;
     Ok(())

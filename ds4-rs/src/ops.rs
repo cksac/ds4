@@ -8,12 +8,74 @@ use objc2_metal::{
 use objc2_foundation::NSString;
 use std::ptr::NonNull;
 use std::ffi::c_void;
+use std::sync::Mutex;
 use crate::bridge;
 use crate::pipeline;
 use crate::tensor::GpuTensor;
 use crate::model_view::ModelViews;
 use crate::gguf::N_HEAD_DIM;
 use crate::metal_args;
+
+// ─── Command buffer batching ────────────────────────────────────────────
+
+struct SendRetained<T: ?Sized>(Retained<ProtocolObject<T>>);
+unsafe impl<T: ?Sized> Send for SendRetained<T> {}
+
+static BATCH_STATE: Mutex<Option<(SendRetained<dyn MTLCommandBuffer>,
+                                   SendRetained<dyn MTLComputeCommandEncoder>)>> =
+    Mutex::new(None);
+
+pub fn begin_batch() -> Result<(), &'static str> {
+    let queue = bridge::queue().ok_or("no queue")?;
+    let cb = queue.commandBuffer().ok_or("no command buffer")?;
+    let enc = cb.computeCommandEncoder().ok_or("no encoder")?;
+    let mut state = BATCH_STATE.lock().unwrap();
+    *state = Some((SendRetained(cb), SendRetained(enc)));
+    Ok(())
+}
+
+pub fn end_batch() -> Result<(), &'static str> {
+    let mut state = BATCH_STATE.lock().unwrap();
+    if let Some((cb, enc)) = state.take() {
+        enc.0.endEncoding();
+        cb.0.commit();
+        drop(state);
+        cb.0.waitUntilCompleted();
+        if cb.0.status() == objc2_metal::MTLCommandBufferStatus::Error {
+            return Err("gpu kernel failed");
+        }
+    }
+    Ok(())
+}
+
+pub fn flush_batch() -> Result<(), &'static str> {
+    end_batch()?;
+    begin_batch()
+}
+
+fn with_encoder<F, R>(f: F) -> Result<R, &'static str>
+where F: FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>) -> Result<R, &'static str>
+{
+    let state = BATCH_STATE.lock().unwrap();
+    if let Some((_cb, ref enc)) = state.as_ref() {
+        let enc_ref: &ProtocolObject<dyn MTLComputeCommandEncoder> = &*enc.0;
+        f(enc_ref)
+    } else {
+        // One-shot: create a temporary command buffer + encoder
+        drop(state);
+        let queue = bridge::queue().ok_or("no queue")?;
+        let cb = queue.commandBuffer().ok_or("no command buffer")?;
+        let enc = cb.computeCommandEncoder().ok_or("no encoder")?;
+        let r = f(&*enc);
+        enc.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+        if cb.status() == objc2_metal::MTLCommandBufferStatus::Error {
+            return Err("gpu kernel failed");
+        }
+        r
+    }
+}
 
 fn wait_gpu(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<(), &'static str> {
     cb.waitUntilCompleted();
@@ -163,36 +225,33 @@ fn dispatch_with_args_tg<T: Sized>(
     tg_size: (usize, usize, usize),
     tg_mem: u64,
 ) -> Result<(), &'static str> {
-    let queue  = bridge::queue().ok_or("no queue")?;
-    let device = bridge::device().ok_or("no device")?;
-    let cb  = queue.commandBuffer().ok_or("no command buffer")?;
-    let enc = cb.computeCommandEncoder().ok_or("no encoder")?;
-    enc.setComputePipelineState(pipeline);
+    with_encoder(|enc| {
+        let device = bridge::device().ok_or("no device")?;
+        enc.setComputePipelineState(pipeline);
 
-    let args_buf = unsafe {
-        device.newBufferWithBytes_length_options(
-            NonNull::new(args as *const T as *mut c_void).unwrap(),
-            std::mem::size_of::<T>(),
-            MTLResourceOptions::StorageModeShared,
-        )
-    }.ok_or("args buffer alloc")?;
-    unsafe { enc.setBuffer_offset_atIndex(Some(&*args_buf), 0, 0); }
+        let args_buf = unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(args as *const T as *mut c_void).unwrap(),
+                std::mem::size_of::<T>(),
+                MTLResourceOptions::StorageModeShared,
+            )
+        }.ok_or("args buffer alloc")?;
+        unsafe { enc.setBuffer_offset_atIndex(Some(&*args_buf), 0, 0); }
 
-    for (i, (buf, off)) in buffers.iter().enumerate() {
-        if let Some(b) = buf {
-            unsafe { enc.setBuffer_offset_atIndex(Some(*b), *off as usize, i + 1); }
+        for (i, (buf, off)) in buffers.iter().enumerate() {
+            if let Some(b) = buf {
+                unsafe { enc.setBuffer_offset_atIndex(Some(*b), *off as usize, i + 1); }
+            }
         }
-    }
-    if tg_mem > 0 {
-        unsafe { enc.setThreadgroupMemoryLength_atIndex(tg_mem as usize, 0); }
-    }
-    enc.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: threads.0, height: threads.1, depth: threads.2 },
-        MTLSize { width: tg_size.0, height: tg_size.1, depth: tg_size.2 },
-    );
-    enc.endEncoding();
-    cb.commit();
-    wait_gpu(&*cb)
+        if tg_mem > 0 {
+            unsafe { enc.setThreadgroupMemoryLength_atIndex(tg_mem as usize, 0); }
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: threads.0, height: threads.1, depth: threads.2 },
+            MTLSize { width: tg_size.0, height: tg_size.1, depth: tg_size.2 },
+        );
+        Ok(())
+    })
 }
 
 fn dispatch_with_args<T: Sized>(
@@ -231,22 +290,19 @@ fn dispatch_raw(
     threads: (usize, usize, usize),
     tg_size: (usize, usize, usize),
 ) -> Result<(), &'static str> {
-    let queue = bridge::queue().ok_or("no queue")?;
-    let cb  = queue.commandBuffer().ok_or("no command buffer")?;
-    let enc = cb.computeCommandEncoder().ok_or("no encoder")?;
-    enc.setComputePipelineState(pipeline);
-    for (i, (buf, off)) in buffers.iter().enumerate() {
-        if let Some(b) = buf {
-            unsafe { enc.setBuffer_offset_atIndex(Some(*b), *off as usize, i); }
+    with_encoder(|enc| {
+        enc.setComputePipelineState(pipeline);
+        for (i, (buf, off)) in buffers.iter().enumerate() {
+            if let Some(b) = buf {
+                unsafe { enc.setBuffer_offset_atIndex(Some(*b), *off as usize, i); }
+            }
         }
-    }
-    enc.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: threads.0, height: threads.1, depth: threads.2 },
-        MTLSize { width: tg_size.0, height: tg_size.1, depth: tg_size.2 },
-    );
-    enc.endEncoding();
-    cb.commit();
-    wait_gpu(&*cb)
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: threads.0, height: threads.1, depth: threads.2 },
+            MTLSize { width: tg_size.0, height: tg_size.1, depth: tg_size.2 },
+        );
+        Ok(())
+    })
 }
 
 fn rms_norm_threads(n: u32) -> u32 {
@@ -963,9 +1019,9 @@ pub fn embed_tokens(
         ne00t: n_embd as i32, ne00: n_embd as i32,
         nb01: n_embd as u64 * 2,
         nb02: 0, nb03: 0,
-        ne10: n_embd as i32, nb10: 4,
+        ne10: 1, nb10: 4,
         nb11: 0, nb12: 0,
-        nb1: n_embd as u64 * 4,
+        nb1: 0,
         nb2: 0, nb3: 0,
     };
     let n = tokens.len() * n_embd as usize;
