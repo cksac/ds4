@@ -321,6 +321,7 @@ fn rms_norm_threads(n: u32) -> u32 {
 }
 
 #[repr(C)]
+#[repr(C)]
 struct MulMvArgs {
     ne00: i32, ne01: i32, ne02: i32,
     nb00: u64, nb01: u64, nb02: u64, nb03: u64,
@@ -422,6 +423,7 @@ struct CompressorStoreOneArgs {
     width: u32, ratio: u32, pos: u32, ape_type: u32,
 }
 
+#[repr(C)]
 #[repr(C)]
 struct MulMvIdArgs {
     nei0: i32, nei1: i32, nbi1: u64,
@@ -1040,23 +1042,41 @@ pub fn embed_tokens(
 
 // ─── Router ─────────────────────────────────────────────────────────────
 
+/// `hash_offset`: when `Some(abs_offset)`, enables hash-mode routing using
+/// the `ffn_gate_tid2eid` lookup table stored at that model offset.
+/// `token`: the current token ID (used only in hash mode).
+/// `hash_rows`: N_VOCAB — number of rows in the hash table (used only in hash mode).
 pub fn router_select_one(
     probs: &GpuTensor, bias: &GpuTensor,
     selected: &GpuTensor, _n_expert: u32, has_bias: bool,
+    views: &ModelViews,
+    hash_offset: Option<u64>, token: u32, hash_rows: u32,
 ) -> Result<(), &'static str> {
+    let hash_mode = hash_offset.is_some();
     let args = metal_args::RouterSelectOneArgs {
-        has_bias: has_bias as u32, hash_mode: 0, use_token_buffer: 0,
-        token: 0, hash_rows: 0,
+        has_bias: has_bias as u32,
+        hash_mode: hash_mode as u32,
+        use_token_buffer: 0,
+        token,
+        hash_rows,
     };
     let device = bridge::device().ok_or("no device")?;
     let zero = unsafe {
         device.newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared)
     }.ok_or("zero buffer")?;
+    // hash table: [N_VOCAB rows × N_EXPERT_USED=6 cols × i32]
+    let (hbuf, hoff): (Option<&ProtocolObject<dyn MTLBuffer>>, u64) = if let Some(off) = hash_offset {
+        let hash_bytes = hash_rows as u64 * 6 * 4;
+        let (b, o) = views.find_view(off, hash_bytes).ok_or("hash table view not found")?;
+        (Some(b), o)
+    } else {
+        (Some(&*zero), 0)
+    };
     dispatch_pipeline_tg("kernel_dsv4_router_finalize_one", &args,
         &[(probs.buf_ref(), probs.offset_raw()),
           (bias.buf_ref(), bias.offset_raw()),
-          (Some(&*zero), 0),
-          (Some(&*zero), 0),
+          (hbuf, hoff),         // index 3: hash buffer (used when hash_mode=1)
+          (Some(&*zero), 0),    // index 4: token buffer (not used; token is in args)
           (selected.buf_ref(), selected.offset_raw())],
         (1, 1, 1), (256, 1, 1),
         2048) // 256*sizeof(float) + 256*sizeof(int32_t)
@@ -1131,16 +1151,26 @@ pub fn indexed_attention(
         (&*dummy_buf, 0)
     };
     let (topk_buf, topk_off) = topk.map_or((None, 0), |t| (t.buf_ref(), t.offset_raw()));
-    // kernel uses threadgroup float4 *kv_shared[128] = 2048 bytes
-    dispatch_pipeline_tg("kernel_dsv4_indexed_mixed_attention_heads8", &args,
+    // Single-token decode uses the _rb4 kernel (optimised for decode); prefill uses the base kernel.
+    // Threadgroup shape: (32, 8, 1) = 256 threads per group, 8 heads per group.
+    // Threadgroup memory: 4×128×float4 for decode, 1×128×float4 for prefill.
+    let decode_one_token = n_tokens == 1;
+    let kernel = if decode_one_token {
+        "kernel_dsv4_indexed_mixed_attention_heads8_rb4"
+    } else {
+        "kernel_dsv4_indexed_mixed_attention_heads8"
+    };
+    let tg_mem: u64 = if decode_one_token { 4 * 128 * 4 * 4 } else { 128 * 4 * 4 };
+    let n_head_groups = ((n_head + 7) / 8) as usize;
+    dispatch_pipeline_tg(kernel, &args,
         &[(q.buf_ref(), q.offset_raw()),
           (raw_kv.buf_ref(), raw_kv.offset_raw()),
           (comp_kv.buf_ref(), comp_kv.offset_raw()),
           (topk_buf, topk_off),
           (Some(sink_ref), sink_off),
           (heads.buf_ref(), heads.offset_raw())],
-        (n_tokens as usize, (n_head / 8 + 1) as usize, 1), (128, 1, 1),
-        2048) // 128 * sizeof(float4)
+        (n_tokens as usize, n_head_groups, 1), (32, 8, 1),
+        tg_mem)
 }
 
 // ─── Directional steering project ───────────────────────────────────────
@@ -1162,24 +1192,26 @@ pub fn directional_steering_project(
 
 pub fn matmul_id_iq2_xxs_pair(
     dst_gate: &GpuTensor, dst_up: &GpuTensor,
-    views: &ModelViews, gate_offset: u64, _up_offset: u64,
+    views: &ModelViews, gate_offset: u64, up_offset: u64,
     in_dim: u32, out_dim: u32, n_expert: u32,
     x: &GpuTensor, selected: &[i32],
 ) -> Result<(), &'static str> {
     let nr0: u32 = 4;
-    let step = in_dim as u64 / 256 * 66 * out_dim as u64;
-    let total_bytes = step * n_expert as u64 * 2;
-    let (wbuf, woff) = views.find_view(gate_offset, total_bytes)
-        .ok_or("iq2 expert view not found")?;
+    let nb01 = in_dim as u64 / 256 * 66;
+    let step = nb01 * out_dim as u64;
+    let total_bytes = step * n_expert as u64;
+    let (wbuf_g, woff_g) = views.find_view(gate_offset, total_bytes)
+        .ok_or("iq2 gate view not found")?;
+    let (wbuf_u, woff_u) = views.find_view(up_offset, total_bytes)
+        .ok_or("iq2 up view not found")?;
+    let n_sel = selected.len();
     let args = MulMvIdArgs {
-        nei0: 1, nei1: selected.len() as i32, nbi1: 4,
+        nei0: n_sel as i32, nei1: 1, nbi1: (n_sel * 4) as u64,
         ne00: in_dim as i32, ne01: out_dim as i32,
         ne02: (n_expert * in_dim / 256 * 66) as i32,
-        nb00: 66, nb01: in_dim as u64 / 256 * 66,
-        nb02: in_dim as u64 / 256 * 66 * out_dim as u64,
+        nb00: 66, nb01, nb02: step,
         ne10: in_dim as i32, ne11: 1, ne12: 1, ne13: 1,
-        nb10: 4, nb11: in_dim as u64 * 4,
-        nb12: in_dim as u64 * 4,
+        nb10: 4, nb11: in_dim as u64 * 4, nb12: 0,
         ne0: out_dim as i32, ne1: 1, nb1: out_dim as u64 * 4,
         nr0: nr0 as i32,
     };
@@ -1187,49 +1219,53 @@ pub fn matmul_id_iq2_xxs_pair(
     let sel_buf = unsafe {
         device.newBufferWithBytes_length_options(
             NonNull::new(selected.as_ptr() as *mut c_void).unwrap(),
-            selected.len() * 4,
+            n_sel * 4,
             MTLResourceOptions::StorageModeShared,
         )
     }.ok_or("sel buffer")?;
-    let nsg: i16 = 4;
+    let nsg: i16 = 2;
     let p = make_matmul_pipeline("kernel_mul_mv_id_iq2_xxs_pair_f32", nsg, 1)
         .ok_or("iq2 pair pipeline")?;
-    let up_off = woff + step * n_expert as u64;
-    let smem = (32 * nr0 * 4) as u64;
+    let smem: u64 = 256 * 8 + 128; // svalues[256] + ssigns[128]
     dispatch_with_args_tg(&*p, &args,
-        &[(Some(wbuf), woff),
-          (Some(wbuf), up_off),
+        &[(Some(wbuf_g), woff_g),
+          (Some(wbuf_u), woff_u),
           (x.buf_ref(), x.offset_raw()),
           (dst_gate.buf_ref(), dst_gate.offset_raw()),
           (dst_up.buf_ref(), dst_up.offset_raw()),
           (Some(&*sel_buf), 0)],
-        ((out_dim / nr0 + 1) as usize, 1, selected.len()),
+        ((out_dim / nr0 + 1) as usize, 1, n_sel),
         (32, nsg as usize, 1), smem)
 }
 
-// ─── Expert matmul: Q2_K sum6 ───────────────────────────────────────────
+// ─── Expert matmul: Q2_K pair (gate+up, one input → n_sel output rows each) ──
+// There is no Q2_K fused-pair kernel, so we use two passes of the generic
+// kernel_mul_mv_id_q2_K_f32 kernel with nei0=n_sel so that each z-slice
+// addresses a different expert slot and writes to a different output row.
 
 #[allow(non_snake_case)]
 pub fn matmul_id_q2_K_sum6(
     dst_gate: &GpuTensor, dst_up: &GpuTensor,
-    views: &ModelViews, gate_offset: u64, _up_offset: u64,
+    views: &ModelViews, gate_offset: u64, up_offset: u64,
     in_dim: u32, out_dim: u32, n_expert: u32,
     x: &GpuTensor, selected: &[i32],
 ) -> Result<(), &'static str> {
     let nr0: u32 = 4;
-    let step = in_dim as u64 / 256 * 84 * out_dim as u64;
-    let total_bytes = step * n_expert as u64 * 2;
-    let (wbuf, woff) = views.find_view(gate_offset, total_bytes)
-        .ok_or("q2_K expert view not found")?;
+    let nb01 = in_dim as u64 / 256 * 84;
+    let step = nb01 * out_dim as u64;
+    let total_bytes = step * n_expert as u64;
+    let (wbuf_g, woff_g) = views.find_view(gate_offset, total_bytes)
+        .ok_or("q2_K gate pair view not found")?;
+    let (wbuf_u, woff_u) = views.find_view(up_offset, total_bytes)
+        .ok_or("q2_K up pair view not found")?;
+    let n_sel = selected.len();
     let args = MulMvIdArgs {
-        nei0: 1, nei1: selected.len() as i32, nbi1: 4,
+        nei0: n_sel as i32, nei1: 1, nbi1: (n_sel * 4) as u64,
         ne00: in_dim as i32, ne01: out_dim as i32,
         ne02: (n_expert * in_dim / 256 * 84) as i32,
-        nb00: 84, nb01: in_dim as u64 / 256 * 84,
-        nb02: in_dim as u64 / 256 * 84 * out_dim as u64,
+        nb00: 84, nb01, nb02: step,
         ne10: in_dim as i32, ne11: 1, ne12: 1, ne13: 1,
-        nb10: 4, nb11: in_dim as u64 * 4,
-        nb12: in_dim as u64 * 4,
+        nb10: 4, nb11: in_dim as u64 * 4, nb12: 0,
         ne0: out_dim as i32, ne1: 1, nb1: out_dim as u64 * 4,
         nr0: nr0 as i32,
     };
@@ -1237,49 +1273,53 @@ pub fn matmul_id_q2_K_sum6(
     let sel_buf = unsafe {
         device.newBufferWithBytes_length_options(
             NonNull::new(selected.as_ptr() as *mut c_void).unwrap(),
-            selected.len() * 4,
+            n_sel * 4,
             MTLResourceOptions::StorageModeShared,
         )
     }.ok_or("sel buffer")?;
     let nsg: i16 = 4;
-    let p = make_matmul_pipeline("kernel_mul_mv_id_q2_K_sum6_f32", nsg, 1)
-        .ok_or("q2 sum6 pipeline")?;
-    let up_off = woff + step * n_expert as u64;
+    let p = make_matmul_pipeline("kernel_mul_mv_id_q2_K_f32", nsg, 1)
+        .ok_or("q2_K id pipeline")?;
     let smem = (32 * nr0 * 4) as u64;
+    // Gate pass
     dispatch_with_args_tg(&*p, &args,
-        &[(Some(wbuf), woff),
-          (Some(wbuf), up_off),
-          (x.buf_ref(), x.offset_raw()),
-          (dst_gate.buf_ref(), dst_gate.offset_raw()),
-          (dst_up.buf_ref(), dst_up.offset_raw()),
-          (Some(&*sel_buf), 0)],
-        ((out_dim / nr0 + 1) as usize, 1, selected.len()),
+        &[(Some(wbuf_g), woff_g), (x.buf_ref(), x.offset_raw()),
+          (dst_gate.buf_ref(), dst_gate.offset_raw()), (Some(&*sel_buf), 0)],
+        ((out_dim / nr0 + 1) as usize, 1, n_sel),
+        (32, nsg as usize, 1), smem)?;
+    // Up pass
+    dispatch_with_args_tg(&*p, &args,
+        &[(Some(wbuf_u), woff_u), (x.buf_ref(), x.offset_raw()),
+          (dst_up.buf_ref(), dst_up.offset_raw()), (Some(&*sel_buf), 0)],
+        ((out_dim / nr0 + 1) as usize, 1, n_sel),
         (32, nsg as usize, 1), smem)
 }
 
-// ─── Expert matmul: Q4_K sum6 ───────────────────────────────────────────
+// ─── Expert matmul: Q4_K pair (gate+up, one input → n_sel output rows each) ──
 
 #[allow(non_snake_case)]
 pub fn matmul_id_q4_K_sum6(
     dst_gate: &GpuTensor, dst_up: &GpuTensor,
-    views: &ModelViews, gate_offset: u64, _up_offset: u64,
+    views: &ModelViews, gate_offset: u64, up_offset: u64,
     in_dim: u32, out_dim: u32, n_expert: u32,
     x: &GpuTensor, selected: &[i32],
 ) -> Result<(), &'static str> {
     let nr0: u32 = 2;
-    let step = in_dim as u64 / 256 * 144 * out_dim as u64;
-    let total_bytes = step * n_expert as u64 * 2;
-    let (wbuf, woff) = views.find_view(gate_offset, total_bytes)
-        .ok_or("q4_K expert view not found")?;
+    let nb01 = in_dim as u64 / 256 * 144;
+    let step = nb01 * out_dim as u64;
+    let total_bytes = step * n_expert as u64;
+    let (wbuf_g, woff_g) = views.find_view(gate_offset, total_bytes)
+        .ok_or("q4_K pair gate view not found")?;
+    let (wbuf_u, woff_u) = views.find_view(up_offset, total_bytes)
+        .ok_or("q4_K pair up view not found")?;
+    let n_sel = selected.len();
     let args = MulMvIdArgs {
-        nei0: 1, nei1: selected.len() as i32, nbi1: 4,
+        nei0: n_sel as i32, nei1: 1, nbi1: (n_sel * 4) as u64,
         ne00: in_dim as i32, ne01: out_dim as i32,
         ne02: (n_expert * in_dim / 256 * 144) as i32,
-        nb00: 144, nb01: in_dim as u64 / 256 * 144,
-        nb02: in_dim as u64 / 256 * 144 * out_dim as u64,
+        nb00: 144, nb01, nb02: step,
         ne10: in_dim as i32, ne11: 1, ne12: 1, ne13: 1,
-        nb10: 4, nb11: in_dim as u64 * 4,
-        nb12: in_dim as u64 * 4,
+        nb10: 4, nb11: in_dim as u64 * 4, nb12: 0,
         ne0: out_dim as i32, ne1: 1, nb1: out_dim as u64 * 4,
         nr0: nr0 as i32,
     };
@@ -1287,23 +1327,22 @@ pub fn matmul_id_q4_K_sum6(
     let sel_buf = unsafe {
         device.newBufferWithBytes_length_options(
             NonNull::new(selected.as_ptr() as *mut c_void).unwrap(),
-            selected.len() * 4,
+            n_sel * 4,
             MTLResourceOptions::StorageModeShared,
         )
     }.ok_or("sel buffer")?;
     let nsg: i16 = 4;
-    let p = make_matmul_pipeline("kernel_mul_mv_id_q4_K_sum6_f32", nsg, 1)
-        .ok_or("q4 sum6 pipeline")?;
-    let up_off = woff + step * n_expert as u64;
+    let p = make_matmul_pipeline("kernel_mul_mv_id_q4_K_pair_f32", nsg, 1)
+        .ok_or("q4_K pair pipeline")?;
     let smem = (32 * nr0 * 4) as u64;
     dispatch_with_args_tg(&*p, &args,
-        &[(Some(wbuf), woff),
-          (Some(wbuf), up_off),
+        &[(Some(wbuf_g), woff_g),
+          (Some(wbuf_u), woff_u),
           (x.buf_ref(), x.offset_raw()),
           (dst_gate.buf_ref(), dst_gate.offset_raw()),
           (dst_up.buf_ref(), dst_up.offset_raw()),
           (Some(&*sel_buf), 0)],
-        ((out_dim / nr0 + 1) as usize, 1, selected.len()),
+        ((out_dim / nr0 + 1) as usize, 1, n_sel),
         (32, nsg as usize, 1), smem)
 }
 
@@ -1468,10 +1507,10 @@ pub fn matmul_id_iq2_xxs_f32(
             selected.len() * 4, MTLResourceOptions::StorageModeShared,
         )
     }.ok_or("sel buffer")?;
-    let nsg: i16 = 4;
+    let nsg: i16 = 2;
     let p = make_matmul_pipeline("kernel_mul_mv_id_iq2_xxs_f32", nsg, 1)
         .ok_or("iq2_xxs id pipeline")?;
-    let smem = (32 * nr0 * 4) as u64;
+    let smem: u64 = 256 * 8 + 128;
     dispatch_with_args_tg(&*p, &args,
         &[(Some(wbuf), woff), (x.buf_ref(), x.offset_raw()),
           (dst.buf_ref(), dst.offset_raw()), (Some(&*sel_buf), 0)],

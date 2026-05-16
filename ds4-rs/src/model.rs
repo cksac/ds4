@@ -173,4 +173,10 @@ pub struct Vocab {
     pub unk_id: i32,
     pub sep_id: i32,
     pub pad_id: i32,
+    /// Pre-built: merged-pair string → merge rank (index in merges list).
+    /// Avoids O(n_merges) rebuild on every tokenize call.
+    pub merge_ranks: std::collections::HashMap<String, i32>,
+    /// Pre-built: token string → token ID.
+    /// Avoids O(n_vocab) rebuild on every BPE piece encoding.
+    pub token_map: std::collections::HashMap<String, i32>,
 }

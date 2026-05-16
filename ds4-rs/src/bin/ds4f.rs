@@ -1,8 +1,30 @@
 //! ds4f - Unified DS4 CLI: run and serve
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
 use clap::{Parser, Subcommand, Args};
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn sigint_handler(_sig: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
+/// Install SIGINT handler; returns the old sigaction for restoration.
+unsafe fn install_sigint() -> libc::sigaction {
+    let mut old = std::mem::zeroed::<libc::sigaction>();
+    let mut sa = std::mem::zeroed::<libc::sigaction>();
+    sa.sa_sigaction = sigint_handler as *const () as usize;
+    libc::sigemptyset(&mut sa.sa_mask);
+    sa.sa_flags = 0;
+    libc::sigaction(libc::SIGINT, &sa, &mut old);
+    old
+}
+
+/// Restore a previously saved sigaction.
+unsafe fn restore_sigint(old: &libc::sigaction) {
+    libc::sigaction(libc::SIGINT, old, std::ptr::null_mut());
+}
 
 const DEFAULT_MODEL: &str = "ds4flash.gguf";
 
@@ -148,7 +170,7 @@ fn load_model(model_path: &str, ctx_size: u32, quiet: bool) -> ds4_rs::session::
                     eprintln!("ds4: model views created in {:.3} ms (mapped {:.2} MiB from offset {:.2} MiB, tensors={} kv={})",
                         t_map_ms, size_mib, offset_mib, model.n_tensors, model.n_kv);
                 }
-                match ds4_rs::session::SessionState::from_model(&model) {
+                match ds4_rs::session::SessionState::from_model(&model, ctx_size) {
                     Ok(s) => {
                         if !quiet {
                             eprintln!("ds4: context buffers (ctx={}, backend=metal, prefill_chunk={}, raw_kv_rows={}, compressed_kv_rows={})",
@@ -206,6 +228,117 @@ fn cmd_run(opts: RunArgs) {
     }
 }
 
+// ── Token printer (matches C token_printer) ──────────────────────────────
+
+/// Handles `<think>` / `</think>` tag stripping and greyed-out thinking display.
+/// Matches the behaviour of C `token_printer_process` in ds4_cli.c.
+struct TokenPrinter {
+    format_thinking: bool,
+    in_think: bool,
+    use_color: bool,
+    color_open: bool,
+    pending: Vec<u8>,
+    last_newline: bool,
+}
+
+impl TokenPrinter {
+    fn new(think: bool) -> Self {
+        let use_color = unsafe { libc::isatty(libc::STDOUT_FILENO) } != 0;
+        TokenPrinter {
+            format_thinking: think,
+            in_think: think,
+            use_color,
+            color_open: false,
+            pending: Vec::new(),
+            last_newline: true,
+        }
+    }
+
+    fn set_grey(&mut self) {
+        if self.use_color && !self.color_open {
+            print!("\x1b[90m");
+            self.color_open = true;
+        }
+    }
+
+    fn reset_color(&mut self) {
+        if self.use_color && self.color_open {
+            print!("\x1b[0m");
+            self.color_open = false;
+        }
+    }
+
+    fn write_byte(&mut self, b: u8) {
+        if self.in_think { self.set_grey(); }
+        let _ = std::io::Write::write(&mut std::io::stdout(), &[b]);
+        self.last_newline = b == b'\n';
+    }
+
+    fn process(&mut self, text: &[u8], finish: bool) {
+        let think_open = b"<think>" as &[u8];
+        let think_close = b"</think>" as &[u8];
+
+        let mut buf: Vec<u8> = std::mem::take(&mut self.pending);
+        buf.extend_from_slice(text);
+
+        let mut i = 0;
+        while i < buf.len() {
+            let cur = &buf[i..];
+            if cur.starts_with(think_open) {
+                self.in_think = true;
+                i += think_open.len();
+                continue;
+            }
+            if cur.starts_with(think_close) {
+                self.in_think = false;
+                self.reset_color();
+                if !self.last_newline {
+                    print!("\n");
+                    self.last_newline = true;
+                }
+                i += think_close.len();
+                continue;
+            }
+            // Partial tag at end of buffer: defer if not finishing
+            if !finish && cur[0] == b'<' {
+                let maybe_partial = |tag: &[u8]| {
+                    let n = cur.len().min(tag.len());
+                    n < tag.len() && cur[..n] == tag[..n]
+                };
+                if maybe_partial(think_open) || maybe_partial(think_close) {
+                    self.pending = cur.to_vec();
+                    return;
+                }
+            }
+            self.write_byte(cur[0]);
+            i += 1;
+        }
+    }
+
+    pub fn write_text(&mut self, text: &str) {
+        if self.format_thinking {
+            self.process(text.as_bytes(), false);
+        } else {
+            print!("{}", text);
+            if let Some(&b) = text.as_bytes().last() {
+                self.last_newline = b == b'\n';
+            }
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    pub fn finish(&mut self) {
+        if self.format_thinking {
+            self.process(&[], true);
+            self.reset_color();
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if !self.last_newline {
+            println!();
+        }
+    }
+}
+
 // ── One-shot generation ───────────────────────────────────────────────────
 
 fn run_one_shot(mut sess: ds4_rs::session::SessionState, opts: &RunArgs, prompt: &str, think: bool) {
@@ -216,6 +349,17 @@ fn run_one_shot(mut sess: ds4_rs::session::SessionState, opts: &RunArgs, prompt:
         None => { eprintln!("No vocab loaded."); std::process::exit(1); }
     };
     let n_prompt = tokens.len();
+    // Debug: print token IDs (remove after debugging)
+    if std::env::var("DS4_DEBUG_TOKENS").is_ok() {
+        eprintln!("ds4: rendered prompt: {:?}", &rendered[..rendered.len().min(120)]);
+        eprintln!("ds4: n_tokens={}", n_prompt);
+        for &t in &tokens {
+            if let Some(ref vocab) = sess.vocab {
+                let txt = ds4_rs::tokenizer::token_decode(vocab, &[t]);
+                eprintln!("  {:6}  {:?}", t, txt);
+            }
+        }
+    }
 
     // Time prefill separately
     let t_prefill_start = std::time::Instant::now();
@@ -225,28 +369,38 @@ fn run_one_shot(mut sess: ds4_rs::session::SessionState, opts: &RunArgs, prompt:
         std::process::exit(1);
     }
     let t_prefill = t_prefill_start.elapsed();
-    eprintln!("ds4: prefill done in {:.3}s", t_prefill.as_secs_f64());
+    eprintln!("ds4: prefill done in {:.3}s ({:.2} t/s)",
+        t_prefill.as_secs_f64(),
+        if t_prefill.as_secs_f64() > 0.0 { n_prompt as f64 / t_prefill.as_secs_f64() } else { 0.0 });
 
-    // Time generation separately, stream tokens as they are produced
+    let mut rng_seed = opts.seed;
+
     let t_gen_start = std::time::Instant::now();
     let mut result_tokens = Vec::new();
+    let mut printer = TokenPrinter::new(think);
+
+    INTERRUPTED.store(false, Ordering::Relaxed);
+    let old_sigint = unsafe { install_sigint() };
+
     for _ in 0..opts.n_predict {
-        let token = if opts.temperature < 0.01 { sess.argmax().0 } else { sess.sample(opts.temperature, opts.top_k) };
+        if INTERRUPTED.load(Ordering::Relaxed) { break; }
+        let token = sess.sample_with_seed(opts.temperature, opts.top_p, &mut rng_seed);
         if sess.is_stop_token(token) { break; }
         result_tokens.push(token);
         if let Some(ref vocab) = sess.vocab {
             let txt = ds4_rs::tokenizer::token_decode(vocab, &[token]);
-            print!("{}", txt);
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            printer.write_text(&txt);
         }
         if let Err(e) = sess.decode(token) {
             eprintln!("\nDecode error: {}", e);
             break;
         }
     }
-    let t_gen = t_gen_start.elapsed();
-    println!();
+    printer.finish();
+    unsafe { restore_sigint(&old_sigint) };
+    INTERRUPTED.store(false, Ordering::Relaxed);
 
+    let t_gen = t_gen_start.elapsed();
     let n_gen = result_tokens.len();
     let prefill_tps = if t_prefill.as_secs_f64() > 0.0 { n_prompt as f64 / t_prefill.as_secs_f64() } else { 0.0 };
     let gen_tps = if t_gen.as_secs_f64() > 0.0 { n_gen as f64 / t_gen.as_secs_f64() } else { 0.0 };
@@ -261,6 +415,9 @@ fn run_repl(mut sess: ds4_rs::session::SessionState, opts: &RunArgs, mut think: 
 
     let mut transcript: Vec<(String, String)> = Vec::new();
     push_system(&mut transcript, &opts.system);
+
+    INTERRUPTED.store(false, Ordering::Relaxed);
+    let old_sigint = unsafe { install_sigint() };
 
     for line in stdin().lock().lines() {
         let line = match line { Ok(l) => l, Err(_) => break };
@@ -312,6 +469,7 @@ fn run_repl(mut sess: ds4_rs::session::SessionState, opts: &RunArgs, mut think: 
         do_chat_turn(&mut sess, &mut transcript, &line, opts.n_predict, opts.temperature, opts.top_k, think);
         eprint!("ds4> ");
     }
+    unsafe { restore_sigint(&old_sigint) };
     println!();
 }
 
@@ -398,6 +556,10 @@ fn do_chat_turn(
 }
 
 fn render_prompt(prompt: &str, system: &str, think: bool) -> String {
+    // If the prompt is already a fully-rendered chat (starts with BOS), use it verbatim.
+    if prompt.starts_with("<｜begin▁of▁sentence｜>") {
+        return prompt.to_string();
+    }
     let mut out = String::from("<｜begin▁of▁sentence｜>");
     if !system.is_empty() { out.push_str(system); }
     out.push_str("<｜User｜>");

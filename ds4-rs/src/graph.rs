@@ -6,6 +6,70 @@ use crate::ops;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
 
+/// Dump a raw byte slice to a file matching C's dump format.
+/// Only active when DS4_DUMP_PREFIX env var is set.
+/// File path: {prefix}_{name}-{layer}_pos{pos}.{ext}
+fn dump_raw(data: &[u8], ext: &str, name: &str, il: usize, pos: u32) {
+    let prefix = match std::env::var("DS4_DUMP_PREFIX") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    if let Ok(name_filter) = std::env::var("DS4_DUMP_NAME") {
+        if !name_filter.is_empty() && !name_filter.contains(name) { return; }
+    }
+    if let Ok(layer_filter) = std::env::var("DS4_DUMP_LAYER") {
+        if !layer_filter.is_empty() && layer_filter != "all" {
+            if layer_filter.parse::<usize>().ok() != Some(il) { return; }
+        }
+    }
+    if let Ok(pos_filter) = std::env::var("DS4_DUMP_POS") {
+        if !pos_filter.is_empty() {
+            if pos_filter.parse::<u32>().ok() != Some(pos) { return; }
+        }
+    }
+    let path = format!("{}_{}-{}_pos{}.{}", prefix, name, il, pos, ext);
+    if let Err(e) = std::fs::write(&path, data) {
+        eprintln!("ds4: dump failed for {}: {}", path, e);
+    } else {
+        eprintln!("ds4: dumped {} layer {} pos {} to {}", name, il, pos, path);
+    }
+}
+
+/// Dump a GPU tensor to a binary f32 file matching C's dump format.
+/// Only active when DS4_DUMP_PREFIX env var is set.
+/// File path: {prefix}_{name}-{layer}_pos{pos}.bin
+/// Flushes (commits + restarts) the current Metal batch before reading.
+fn dump_tensor(t: &GpuTensor, name: &str, n_f32: usize, il: usize, pos: u32) {
+    let prefix = match std::env::var("DS4_DUMP_PREFIX") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    if let Ok(name_filter) = std::env::var("DS4_DUMP_NAME") {
+        if !name_filter.is_empty() && !name_filter.contains(name) { return; }
+    }
+    if let Ok(layer_filter) = std::env::var("DS4_DUMP_LAYER") {
+        if !layer_filter.is_empty() && layer_filter != "all" {
+            if layer_filter.parse::<usize>().ok() != Some(il) { return; }
+        }
+    }
+    if let Ok(pos_filter) = std::env::var("DS4_DUMP_POS") {
+        if !pos_filter.is_empty() {
+            if pos_filter.parse::<u32>().ok() != Some(pos) { return; }
+        }
+    }
+    // Flush current batch so GPU writes are committed before we read back.
+    let _ = ops::flush_batch();
+    let path = format!("{}_{}-{}_pos{}.bin", prefix, name, il, pos);
+    if let Ok(data) = t.read_bytes() {
+        let byte_count = (n_f32 * 4).min(data.len());
+        if let Err(e) = std::fs::write(&path, &data[..byte_count]) {
+            eprintln!("ds4: dump failed for {}: {}", path, e);
+        } else {
+            eprintln!("ds4: dumped {} layer {} pos {} to {}", name, il, pos, path);
+        }
+    }
+}
+
 pub struct GpuGraph {
     pub cur_hc: GpuTensor,
     pub after_ffn_hc: GpuTensor,
@@ -110,11 +174,31 @@ const DS4_RMS_EPS: f32 = 1e-6;
 const DS4_HC_EPS: f32 = 1e-6;
 const DS4_ROPE_FREQ_BASE: f32 = 10000.0;
 const DS4_COMPRESS_ROPE_FREQ_BASE: f32 = 160000.0;
-const DS4_ROPE_FREQ_SCALE: f32 = 16.0;
+/// The scale *factor* (= DS4_ROPE_SCALE_FACTOR in the C code).
+/// For non-compressed layers freq_scale = 1.0; for compressed layers
+/// freq_scale = 1.0 / DS4_ROPE_SCALE_FACTOR (i.e. 0.0625), matching C.
+const DS4_ROPE_SCALE_FACTOR: f32 = 16.0;
 const DS4_ROPE_YARN_BETA_FAST: f32 = 32.0;
 const DS4_ROPE_YARN_BETA_SLOW: f32 = 1.0;
 const DS4_ROPE_ORIG_CTX: u32 = 65536;
 const DS4_SWIGLU_CLAMP_EXP: f32 = 10.0;
+
+/// Per-layer RoPE parameters, matching C's `layer_rope_freq_scale` +
+/// ext_factor / attn_factor logic in `metal_graph_encode_decode_layer`.
+fn rope_params(compressed: bool) -> (f32, f32, f32) {
+    if !compressed {
+        // Layers 0-1: standard RoPE, no scaling.
+        (1.0, 0.0, 1.0)
+    } else {
+        // Layers 2-42: YaRN-scaled RoPE.
+        // freq_scale = 1 / DS4_ROPE_SCALE_FACTOR
+        let freq_scale = 1.0 / DS4_ROPE_SCALE_FACTOR;
+        let ext_factor = 1.0f32;
+        // attn_factor = 1 / (1 + 0.1 * ln(1/freq_scale))
+        let attn_factor = 1.0 / (1.0 + 0.1 * (1.0 / freq_scale).ln());
+        (freq_scale, ext_factor, attn_factor)
+    }
+}
 
 fn compress_ratio(il: u32) -> u32 { if il < 2 { 0 } else if (il & 1) == 0 { 4 } else { 128 } }
 fn is_hash_layer(il: u32) -> bool { il < N_HASH_LAYER }
@@ -159,49 +243,63 @@ pub fn eval_token_decode(
                     &graph.hc_split, N_EMBD, N_HC)?;
             }
         }
+        dump_tensor(&graph.attn_cur, "hc_attn_pre", N_EMBD as usize, il, graph.n_pos);
         if let Some(ref norm_w) = lw.attn_norm {
             ops::rms_norm_weight(&graph.attn_norm, &graph.attn_cur,
                 views, norm_w.abs_offset, N_EMBD, DS4_RMS_EPS)?;
         }
+        dump_tensor(&graph.attn_norm, "attn_norm", N_EMBD as usize, il, graph.n_pos);
 
 
         // ─── Q projection ───
         if let (Some(ref qa), Some(ref qb)) = (&lw.attn_q_a, &lw.attn_q_b) {
             ops::matmul_q8_0(&graph.qr, views, qa.abs_offset,
                 N_EMBD as u64, N_LORA_Q as u64, &graph.attn_norm, 1)?;
+            dump_tensor(&graph.qr, "q_lora", N_LORA_Q as usize, il, graph.n_pos);
             if let Some(ref qa_n) = lw.attn_q_a_norm {
                 ops::rms_norm_weight(&graph.qr_norm, &graph.qr,
                     views, qa_n.abs_offset, N_LORA_Q, DS4_RMS_EPS)?;
             }
+            dump_tensor(&graph.qr_norm, "q_lora_norm", N_LORA_Q as usize, il, graph.n_pos);
             ops::matmul_q8_0(&graph.q, views, qb.abs_offset,
                 N_LORA_Q as u64, (N_HEAD * N_HEAD_DIM) as u64, &graph.qr_norm, 1)?;
         }
+        dump_tensor(&graph.q, "Qraw", (N_HEAD * N_HEAD_DIM) as usize, il, graph.n_pos);
         ops::head_rms_norm(&graph.q, 1, N_HEAD, N_HEAD_DIM, DS4_RMS_EPS)?;
+        dump_tensor(&graph.q, "Qnorm", (N_HEAD * N_HEAD_DIM) as usize, il, graph.n_pos);
 
         // ─── KV projection ───
         if let Some(ref kv_a) = lw.attn_kv_a {
             ops::matmul_q8_0(&graph.kv_raw, views, kv_a.abs_offset,
                 N_EMBD as u64, N_HEAD_DIM as u64, &graph.attn_norm, 1)?;
+            dump_tensor(&graph.kv_raw, "KVraw", N_HEAD_DIM as usize, il, graph.n_pos);
             if let Some(ref kv_n) = lw.attn_kv_a_norm {
                 ops::rms_norm_weight(&graph.kv, &graph.kv_raw,
                     views, kv_n.abs_offset, N_HEAD_DIM, DS4_RMS_EPS)?;
             }
+            dump_tensor(&graph.kv, "KVnorm", N_HEAD_DIM as usize, il, graph.n_pos);
         }
 
         // ─── RoPE + KV store ───
         let compressed = ratio != 0;
         let fb = if compressed { DS4_COMPRESS_ROPE_FREQ_BASE } else { DS4_ROPE_FREQ_BASE };
         let nco = if compressed { DS4_ROPE_ORIG_CTX } else { 0 };
+        let (freq_scale, ext_factor, attn_factor) = rope_params(compressed);
         ops::rope_tail(&graph.q, 1, N_HEAD, N_HEAD_DIM, N_ROT, graph.n_pos, nco, false,
-            fb, DS4_ROPE_FREQ_SCALE, 0.0, 1.0,
+            fb, freq_scale, ext_factor, attn_factor,
             DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW)?;
+        dump_tensor(&graph.q, "Qcur", (N_HEAD * N_HEAD_DIM) as usize, il, graph.n_pos);
         ops::rope_tail(&graph.kv, 1, 1, N_HEAD_DIM, N_ROT, graph.n_pos, nco, false,
-            fb, DS4_ROPE_FREQ_SCALE, 0.0, 1.0,
+            fb, freq_scale, ext_factor, attn_factor,
             DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW)?;
+        dump_tensor(&graph.kv, "KVrope", N_HEAD_DIM as usize, il, graph.n_pos);
         ops::kv_fp8_store(&graph.kv, &graph.raw_cache[il], N_HEAD_DIM, N_ROT, row_idx as u32)?;
+        dump_tensor(&graph.kv, "KVcur", N_HEAD_DIM as usize, il, graph.n_pos);
 
         // ─── Attention ───
-        let n_raw_lim = graph.n_raw.min(graph.raw_cap);
+        // n_raw + 1: current token's KV was just stored at row_idx, matching C's
+        // kv_cache_push_raw() which increments n_raw before the attention call.
+        let n_raw_lim = (graph.n_raw + 1).min(graph.raw_cap);
         if n_raw_lim > 0 {
             let sink_view = lw.attn_sinks.as_ref().and_then(|s|
                 views.find_view_retained(s.abs_offset, N_HEAD as u64 * 4));
@@ -222,11 +320,14 @@ pub fn eval_token_decode(
             graph.heads.fill_f32(0.0, (N_HEAD * N_HEAD_DIM) as u64)?;
         }
 
+        dump_tensor(&graph.heads, "kqv_out", (N_HEAD * N_HEAD_DIM) as usize, il, graph.n_pos);
+
         // ─── Inverse RoPE on heads ───
         ops::rope_tail(&graph.heads, 1, N_HEAD, N_HEAD_DIM,
             N_ROT, graph.n_pos, nco, true,
-            fb, DS4_ROPE_FREQ_SCALE, 0.0, 1.0,
+            fb, freq_scale, ext_factor, attn_factor,
             DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW)?;
+        dump_tensor(&graph.heads, "kqv_back", (N_HEAD * N_HEAD_DIM) as usize, il, graph.n_pos);
         if let Some(ref oa) = lw.attn_output_a {
             let n_groups = N_OUT_GROUP;
             let group_dim = N_HEAD_DIM * (N_HEAD / n_groups);
@@ -245,6 +346,7 @@ pub fn eval_token_decode(
                     n_groups as u64 * rank as u64, N_EMBD as u64, &graph.attn_low, 1)?;
             }
         }
+        dump_tensor(&graph.attn_out, "attn_out", N_EMBD as usize, il, graph.n_pos);
         let po = N_HC as u64 * 4;
         let co = (2 * N_HC) as u64 * 4;
         let hp = GpuTensor::wrap(graph.hc_split.retain_buf().unwrap(),
@@ -253,6 +355,7 @@ pub fn eval_token_decode(
             graph.hc_split.offset_raw() + co, N_HC as u64 * N_HC as u64 * 4);
         ops::hc_expand_tensor(&graph.after_attn_hc, &graph.attn_out,
             &graph.cur_hc, &hp, &hc, N_EMBD, N_HC)?;
+        dump_tensor(&graph.after_attn_hc, "hc_attn_post", (N_HC * N_EMBD) as usize, il, graph.n_pos);
 
         // ─── FFN HC pre ───
         ops::rms_norm_plain(&graph.flat_hc, &graph.after_attn_hc, hc_dim, DS4_RMS_EPS)?;
@@ -267,27 +370,38 @@ pub fn eval_token_decode(
                     &graph.hc_split, N_EMBD, N_HC)?;
             }
         }
+        dump_tensor(&graph.ffn_cur, "hc_ffn_pre", N_EMBD as usize, il, graph.n_pos);
         if let Some(ref fnw) = lw.ffn_norm {
             ops::rms_norm_weight(&graph.ffn_norm, &graph.ffn_cur,
                 views, fnw.abs_offset, N_EMBD, DS4_RMS_EPS)?;
         }
+        dump_tensor(&graph.ffn_norm, "ffn_norm", N_EMBD as usize, il, graph.n_pos);
 
         // ─── Router ───
         if let Some(ref gi) = lw.ffn_gate_inp {
             ops::matmul_f16(&graph.router_logits, views, gi.abs_offset,
                 N_EMBD as u64, N_EXPERT as u64, &graph.ffn_norm, 1)?;
+            dump_tensor(&graph.router_logits, "ffn_moe_logits", N_EXPERT as usize, il, graph.n_pos);
             ops::softplus_sqrt(&graph.router_probs, &graph.router_logits, N_EXPERT)?;
+            dump_tensor(&graph.router_probs, "ffn_moe_probs", N_EXPERT as usize, il, graph.n_pos);
             if is_hash_layer(il as u32) {
+                // Hash layers 0-2: use token-based expert lookup table.
+                // has_bias is forced off when hash_mode=1 (kernel ignores bias in hash mode).
+                let hash_offset = lw.ffn_gate_tid2eid.as_ref().map(|t| t.abs_offset);
+                ops::router_select_one(&graph.router_probs,
+                    &graph.router_probs,   // bias unused in hash mode
+                    &graph.router_selected, N_EXPERT, false,
+                    views, hash_offset, token as u32, N_VOCAB)?;
+            } else {
+                // Non-hash layers: softplus probability selection with optional bias.
                 let bt = lw.ffn_exp_probs_b.as_ref().and_then(|b| {
                     let (buf, off) = views.find_view_retained(b.abs_offset, 256*4)?;
                     Some(GpuTensor::wrap(buf, off, 256*4))
                 });
                 ops::router_select_one(&graph.router_probs,
                     bt.as_ref().unwrap_or(&graph.router_probs),
-                    &graph.router_selected, N_EXPERT, bt.is_some())?;
-            } else {
-                ops::router_select_one(&graph.router_probs, &graph.router_probs,
-                    &graph.router_selected, N_EXPERT, false)?;
+                    &graph.router_selected, N_EXPERT, bt.is_some(),
+                    views, None, 0, 0)?;
             }
             ops::router_weights_one(&graph.router_probs,
                 &graph.router_selected, &graph.router_weights)?;
@@ -296,6 +410,13 @@ pub fn eval_token_decode(
             ops::flush_batch()?;
             let mut sel_ids = vec![0i32; N_EXPERT_USED as usize];
             graph.router_selected.read_i32_slice(0, &mut sel_ids)?;
+            // Dump raw i32 expert IDs (matches C's ffn_moe_topk format)
+            {
+                let raw: &[u8] = unsafe { std::slice::from_raw_parts(
+                    sel_ids.as_ptr() as *const u8, sel_ids.len() * 4) };
+                dump_raw(raw, "i32", "ffn_moe_topk", il, graph.n_pos);
+            }
+            dump_tensor(&graph.router_weights, "ffn_moe_weights_scaled", N_EXPERT_USED as usize, il, graph.n_pos);
             for id in sel_ids.iter_mut() {
                 *id = (*id).max(0).min((N_EXPERT - 1) as i32);
             }
@@ -318,11 +439,14 @@ pub fn eval_token_decode(
                     _ => return Err("unsupported expert quant"),
                 };
                 r?;
+                dump_tensor(&graph.routed_gate, "ffn_moe_gate", (N_FF_EXP * N_EXPERT_USED) as usize, il, graph.n_pos);
+                dump_tensor(&graph.routed_up,   "ffn_moe_up",   (N_FF_EXP * N_EXPERT_USED) as usize, il, graph.n_pos);
 
                 // SwiGLU with router weights
                 ops::moe_swiglu_weight(&graph.routed_gate, &graph.routed_up,
                     &graph.routed_mid, &graph.router_weights, N_FF_EXP, N_EXPERT_USED,
                     DS4_SWIGLU_CLAMP_EXP)?;
+                dump_tensor(&graph.routed_mid, "ffn_moe_swiglu", (N_FF_EXP * N_EXPERT_USED) as usize, il, graph.n_pos);
 
                 // Down projection: batch all 6 experts to different rows, then read once
                 let down_type = dx.dtype;
@@ -354,6 +478,9 @@ pub fn eval_token_decode(
                     };
                     r?;
                 }
+                // Flush batch so GPU finishes all down projections before CPU reads.
+                ops::flush_batch()?;
+                dump_tensor(&graph.routed_down, "ffn_moe_down", (N_EMBD * N_EXPERT_USED) as usize, il, graph.n_pos);
                 // Read back 6 rows from routed_down and accumulate
                 {
                     let data = graph.routed_down.read_bytes()?;
@@ -392,15 +519,21 @@ pub fn eval_token_decode(
             ops::matmul_q8_0(&graph.shared_out, views, sd.abs_offset,
                 N_FF_EXP as u64, N_EMBD as u64, &graph.shared_mid, 1)?;
         }
+        dump_tensor(&graph.routed_out, "ffn_moe_out", N_EMBD as usize, il, graph.n_pos);
+        dump_tensor(&graph.shared_out, "ffn_shexp", N_EMBD as usize, il, graph.n_pos);
 
         // ─── HC expand after FFN + swap ───
         ops::hc_expand_add_split_tensor(&graph.after_ffn_hc,
             &graph.routed_out, &graph.shared_out,
             &graph.after_attn_hc, &graph.hc_split, N_EMBD, N_HC)?;
+        dump_tensor(&graph.after_ffn_hc, "hc_ffn_post", (N_HC * N_EMBD) as usize, il, graph.n_pos);
         std::mem::swap(&mut graph.cur_hc, &mut graph.after_ffn_hc);
 
         if ratio != 0 {
-            graph.n_comp[il] = graph.n_comp[il].saturating_add(1).min(graph.raw_cap / 4);
+            // Compressor not yet implemented: n_comp[il] stays 0.
+            // When the compressor is added, increment n_comp[il] only when
+            // a compressed KV is actually written to index_comp[il].
+            let _ = ratio;
         }
     }
 
@@ -427,6 +560,23 @@ pub fn eval_token_decode(
     }
     graph.n_raw = (graph.n_raw + 1).min(graph.raw_cap);
     graph.n_pos += 1;
+
+    // Debug: DS4_DUMP_LOGITS=1 prints top-8 logit indices + values after each token.
+    if std::env::var("DS4_DUMP_LOGITS").as_deref() == Ok("1") {
+        ops::flush_batch()?;
+        let data = graph.logits.read_bytes()?;
+        let floats: &[f32] = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4)
+        };
+        // Find top-8 by value
+        let mut indexed: Vec<(usize, f32)> = floats.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        eprint!("ds4: logits[pos={}] top8:", graph.n_pos - 1);
+        for (id, val) in indexed.iter().take(8) {
+            eprint!(" {}({:.3})", id, val);
+        }
+        eprintln!();
+    }
     Ok(())
 }
 

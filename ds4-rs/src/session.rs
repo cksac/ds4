@@ -37,8 +37,7 @@ impl SessionState {
         }
     }
 
-    pub fn from_model(model: &GgufModel) -> Result<Self, &'static str> {
-        let ctx_size = 65536u32;
+    pub fn from_model(model: &GgufModel, ctx_size: u32) -> Result<Self, &'static str> {
         let (rc, cc, _) = memory_estimate(ctx_size);
         let w = weights::weights_bind(model);
         let views = ModelViews::new(model)?;
@@ -123,15 +122,29 @@ impl SessionState {
         &self.logits
     }
 
-    fn rand_u32() -> u32 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-        let mut state = t.as_nanos() as u32;
-        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
-        state
+    // Xorshift64 RNG matching C behavior (seeded or time-based)
+    fn xorshift64(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
     }
 
-    pub fn sample(&self, temperature: f32, top_k: usize) -> i32 {
+    fn time_seed() -> u64 {
+        // Match C: time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock()
+        // libc::clock is not re-exported by the libc crate on all platforms,
+        // so we declare it manually.
+        extern "C" { fn clock() -> libc::c_long; }
+        let t   = unsafe { libc::time(std::ptr::null_mut()) } as u64;
+        let pid = std::process::id() as u64;
+        let clk = unsafe { clock() } as u64;
+        t ^ (pid << 32) ^ clk
+    }
+
+    /// Sample a token with temperature scaling and top-p (nucleus) filtering.
+    /// seed=0 → time-based seed (matches C default behavior).
+    /// top_p=1.0 → no filtering (full distribution).
+    pub fn sample_with_seed(&self, temperature: f32, top_p: f32, seed: &mut u64) -> i32 {
         let logits = self.get_logits();
         if temperature < 0.01 {
             let mut best = 0i32;
@@ -141,21 +154,54 @@ impl SessionState {
             }
             return best;
         }
-        let scaled: Vec<f32> = logits.iter().map(|&x| x / temperature).collect();
-        let mut candidates: Vec<(i32, f32)> = scaled.iter().copied()
-            .enumerate().map(|(i, s)| (i as i32, s)).collect();
+
+        // Scale by temperature
+        let max_logit = logits.iter().cloned().fold(std::f32::MIN, f32::max);
+        let mut candidates: Vec<(i32, f32)> = logits.iter().copied()
+            .enumerate()
+            .map(|(i, s)| (i as i32, (s - max_logit) / temperature))
+            .collect();
+
+        // Sort descending by scaled logit
         candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let k = top_k.min(candidates.len());
-        candidates.truncate(k);
-        let max_logit = candidates.iter().map(|(_, s)| *s).fold(std::f32::MIN, f32::max);
+
+        // Softmax
+        let max_sc = candidates[0].1;
         let mut sum = 0.0f32;
-        let probs: Vec<(i32, f32)> = candidates.iter().map(|&(id, s)| {
-            let p = (s - max_logit).exp(); sum += p; (id, p)
+        let mut probs: Vec<(i32, f32)> = candidates.iter().map(|&(id, s)| {
+            let p = (s - max_sc).exp(); sum += p; (id, p)
         }).collect();
-        let r = (Self::rand_u32() as f32 / u32::MAX as f32) * sum;
-        let mut cum = 0.0;
-        for (id, p) in &probs { cum += p; if cum >= r { return *id; } }
-        probs.last().map(|(id, _)| *id).unwrap_or(0)
+
+        // Top-p nucleus filtering: keep tokens until cumulative prob >= top_p
+        if top_p < 1.0 - 1e-6 {
+            let mut cum = 0.0f32;
+            let mut cutoff = probs.len();
+            for (k, &(_, p)) in probs.iter().enumerate() {
+                cum += p / sum;
+                if cum >= top_p {
+                    cutoff = k + 1;
+                    break;
+                }
+            }
+            probs.truncate(cutoff);
+            sum = probs.iter().map(|(_, p)| p).sum();
+        }
+
+        // Sample
+        if *seed == 0 { *seed = Self::time_seed(); if *seed == 0 { *seed = 1; } }
+        let rv = Self::xorshift64(seed);
+        let r = (rv as f64 / u64::MAX as f64) as f32 * sum;
+        let mut cum = 0.0f32;
+        for &(id, p) in &probs { cum += p; if cum >= r { return id; } }
+        probs.last().map(|&(id, _)| id).unwrap_or(0)
+    }
+
+    /// Convenience wrapper preserving the old signature for callers not yet updated.
+    pub fn sample(&self, temperature: f32, top_k: usize) -> i32 {
+        // top_k ignored here; callers should migrate to sample_with_seed+top_p.
+        let _ = top_k;
+        let mut seed = Self::time_seed();
+        self.sample_with_seed(temperature, 1.0, &mut seed)
     }
 
     pub fn argmax(&self) -> (i32, f32) {

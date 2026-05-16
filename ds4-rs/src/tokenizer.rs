@@ -92,12 +92,42 @@ fn byte_encode(text: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Inverse of `gpt2_byte_to_cp`: convert a Unicode codepoint stored in a vocab
+/// token string back to the original raw byte.  Returns -1 for codepoints that
+/// are not part of the GPT-2 byte encoding scheme.
+///
+/// Matches C `gpt2_codepoint_to_byte` in ds4.c exactly.
+fn gpt2_cp_to_byte(cp: u32) -> i32 {
+    if (cp >= 33 && cp <= 126) || (cp >= 161 && cp <= 172) || (cp >= 174 && cp <= 255) {
+        return cp as i32;
+    }
+    let mut n = 0u32;
+    for b in 0u32..256 {
+        if (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174) {
+            continue;
+        }
+        if cp == 256 + n { return b as i32; }
+        n += 1;
+    }
+    -1
+}
+
+/// Returns true for tokens that are "literal specials" – i.e. tokens containing
+/// the full-width vertical bar U+FF5C (｜) which appear in DeepSeek control
+/// tokens like `<｜begin▁of▁sentence｜>`.  These are returned verbatim by
+/// `token_decode` without GPT-2 byte reversal, matching C `vocab_token_is_literal_special`.
+fn is_literal_special(s: &str) -> bool {
+    s.contains('\u{FF5C}')
+}
+
 pub fn vocab_load(model: &GgufModel) -> Vocab {
     let mut v = Vocab {
         tokens: Vec::new(),
         merges: Vec::new(),
         scores: Vec::new(),
         bos_id: 1, eos_id: 2, unk_id: 0, sep_id: 3, pad_id: 3,
+        merge_ranks: HashMap::new(),
+        token_map: HashMap::new(),
     };
 
     if let Some(data) = model.find_kv("tokenizer.ggml.tokens") {
@@ -122,13 +152,16 @@ pub fn vocab_load(model: &GgufModel) -> Vocab {
         }
     }
 
+    // Build token_map once here – used both by merge loading and BPE encoding.
+    v.token_map = v.tokens.iter().enumerate()
+        .map(|(i, t)| (t.clone(), i as i32)).collect();
+
     // Load BPE merges
     // GGUF array of strings: [item_type(4) | count(8) | ...]; each item: [len(8) | bytes]
     // Each merge string is "piece_a piece_b" – look up IDs by string (not integer parse).
     if let Some(data) = model.find_kv("tokenizer.ggml.merges") {
-        let token_map: HashMap<String, i32> = v.tokens.iter().enumerate()
-            .map(|(i, t)| (t.clone(), i as i32)).collect();
         let mut i = 12usize; // skip array header
+        let mut rank = 0i32;
         while i + 8 <= data.len() {
             let slen = u64::from_le_bytes(data[i..i+8].try_into().unwrap_or([0;8])) as usize;
             i += 8;
@@ -137,8 +170,15 @@ pub fn vocab_load(model: &GgufModel) -> Vocab {
                 if let Some(sp) = s.find(' ') {
                     let a_str = &s[..sp];
                     let b_str = s[sp+1..].trim_end();
-                    if let (Some(&a), Some(&b)) = (token_map.get(a_str), token_map.get(b_str)) {
+                    if let (Some(&a), Some(&b)) = (v.token_map.get(a_str), v.token_map.get(b_str)) {
                         v.merges.push((a, b));
+                        // Build merge_ranks: merged string → rank
+                        if a < v.tokens.len() as i32 && b < v.tokens.len() as i32 {
+                            let mut merged = v.tokens[a as usize].clone();
+                            merged.push_str(&v.tokens[b as usize]);
+                            v.merge_ranks.entry(merged).or_insert(rank);
+                        }
+                        rank += 1;
                     }
                 }
                 i += slen;
@@ -216,24 +256,8 @@ fn joyai_pre_tokenize(text: &str) -> Vec<String> {
     pieces
 }
 
-// Build a rank table for BPE merges from vocab tokens
-fn build_merge_ranks(vocab: &Vocab) -> HashMap<String, i32> {
-    let mut ranks: HashMap<String, i32> = HashMap::new();
-    for (i, &(a, b)) in vocab.merges.iter().enumerate() {
-        let key = if a < vocab.tokens.len() as i32 && b < vocab.tokens.len() as i32 {
-            let mut s = vocab.tokens[a as usize].clone();
-            s.push_str(&vocab.tokens[b as usize]);
-            s
-        } else {
-            continue;
-        };
-        ranks.entry(key).or_insert(i as i32);
-    }
-    ranks
-}
-
-// BPE encode a single pre-tokenized piece
-fn bpe_encode_piece(vocab: &Vocab, text: &[u8], ranks: &HashMap<String, i32>) -> Vec<i32> {
+// BPE encode a single pre-tokenized piece using pre-built maps
+fn bpe_encode_piece(vocab: &Vocab, text: &[u8]) -> Vec<i32> {
     let encoded = byte_encode(text);
     if encoded.is_empty() { return vec![]; }
 
@@ -247,9 +271,7 @@ fn bpe_encode_piece(vocab: &Vocab, text: &[u8], ranks: &HashMap<String, i32>) ->
         i = end;
     }
 
-    // Byte encoding turns each raw byte into 1-2 UTF-8 bytes.
-    // The tokens in vocab use the byte-encoded form. We look up each symbol.
-    // BPE merge loop
+    // BPE merge loop using pre-built merge_ranks
     loop {
         let mut best_i = -1i32;
         let mut best_rank = i32::MAX;
@@ -258,7 +280,7 @@ fn bpe_encode_piece(vocab: &Vocab, text: &[u8], ranks: &HashMap<String, i32>) ->
             let mut pair = syms[i].clone();
             pair.extend_from_slice(&syms[i + 1]);
             let pair_str = String::from_utf8_lossy(&pair).to_string();
-            if let Some(&rank) = ranks.get(&pair_str) {
+            if let Some(&rank) = vocab.merge_ranks.get(&pair_str) {
                 if rank < best_rank {
                     best_rank = rank;
                     best_i = i as i32;
@@ -276,20 +298,17 @@ fn bpe_encode_piece(vocab: &Vocab, text: &[u8], ranks: &HashMap<String, i32>) ->
         syms.remove(b + 1);
     }
 
-    // Look up each symbol in vocab
+    // Look up each symbol in vocab using pre-built token_map
     let mut out = Vec::new();
-    let token_map: HashMap<String, i32> = vocab.tokens.iter().enumerate()
-        .map(|(i, t)| (t.clone(), i as i32)).collect();
-
     for sym in &syms {
         let s = String::from_utf8_lossy(sym).to_string();
-        if let Some(&id) = token_map.get(&s) {
+        if let Some(&id) = vocab.token_map.get(&s) {
             out.push(id);
         } else {
-            // Fallback: byte-level fallback
+            // Byte-level fallback
             for &b in text {
                 let byte_str = String::from_utf8_lossy(&[b]).to_string();
-                if let Some(&id) = token_map.get(&byte_str) {
+                if let Some(&id) = vocab.token_map.get(&byte_str) {
                     out.push(id);
                 }
             }
@@ -309,8 +328,6 @@ fn is_special_token(t: &str) -> bool {
 }
 
 pub fn bpe_tokenize(vocab: &Vocab, text: &str) -> Vec<i32> {
-    let ranks = build_merge_ranks(vocab);
-
     // Collect special tokens sorted longest-first for greedy left-to-right matching.
     let mut special: Vec<(&str, i32)> = vocab.tokens.iter().enumerate()
         .filter(|(_, t)| is_special_token(t))
@@ -356,7 +373,7 @@ pub fn bpe_tokenize(vocab: &Vocab, text: &str) -> Vec<i32> {
                 Err(_) => { pos = seg_end; continue; }
             };
             for piece in &joyai_pre_tokenize(segment) {
-                out.extend(bpe_encode_piece(vocab, piece.as_bytes(), &ranks));
+                out.extend(bpe_encode_piece(vocab, piece.as_bytes()));
             }
         }
         pos = seg_end;
@@ -365,15 +382,35 @@ pub fn bpe_tokenize(vocab: &Vocab, text: &str) -> Vec<i32> {
     out
 }
 
+/// Decode a list of token IDs to a UTF-8 string, reversing the GPT-2 byte
+/// encoding used in the vocabulary.
+///
+/// Tokens that are "literal specials" (contain U+FF5C ｜, e.g.
+/// `<｜begin▁of▁sentence｜>`) are returned verbatim.  All other tokens have
+/// each Unicode codepoint mapped back to its original byte value via the
+/// inverse of the GPT-2 byte-to-codepoint mapping.
+///
+/// This matches C `ds4_token_text` + `gpt2_codepoint_to_byte` in ds4.c.
 pub fn token_decode(vocab: &Vocab, token_ids: &[i32]) -> String {
-    let mut out = String::new();
+    let mut bytes: Vec<u8> = Vec::new();
     for &tid in token_ids {
         if tid == vocab.bos_id || tid == vocab.eos_id { continue; }
-        if (tid as usize) < vocab.tokens.len() {
-            out.push_str(&vocab.tokens[tid as usize]);
+        let tidx = tid as usize;
+        if tidx >= vocab.tokens.len() {
+            bytes.push(b'?');
+            continue;
+        }
+        let tok = &vocab.tokens[tidx];
+        if is_literal_special(tok) {
+            // Literal special: keep verbatim (U+FF5C-based control tokens)
+            bytes.extend_from_slice(tok.as_bytes());
         } else {
-            out.push('?');
+            // Reverse GPT-2 byte encoding: each char's codepoint → original byte
+            for ch in tok.chars() {
+                let b = gpt2_cp_to_byte(ch as u32);
+                if b >= 0 { bytes.push(b as u8); }
+            }
         }
     }
-    out
+    String::from_utf8_lossy(&bytes).into_owned()
 }
