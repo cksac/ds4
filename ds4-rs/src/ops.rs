@@ -419,6 +419,14 @@ struct KvFp8StoreArgs {
 }
 
 #[repr(C)]
+struct Fp8KvQuantizeArgs {
+    ne00: i64, ne01: i64, ne02: i64, ne03: i64,
+    nb00: u64, nb01: u64, nb02: u64, nb03: u64,
+    nb0: u64, nb1: u64, nb2: u64, nb3: u64,
+    n_rot: i32,
+}
+
+#[repr(C)]
 struct CompressorStoreOneArgs {
     width: u32, ratio: u32, pos: u32, ape_type: u32,
 }
@@ -578,7 +586,7 @@ pub fn rope_tail(
         ne00: head_dim as i64, ne01: n_head as i64, ne02: 1, ne03: 1,
         nb00: 4, nb01: stride, nb02: stride, nb03: stride,
         nb0: 4, nb1: stride, nb2: stride, nb3: stride,
-        n_dims: n_rot as i32, mode: 2, n_ctx_orig: n_ctx_orig as i32,
+        n_dims: n_rot as i32, mode: 0, n_ctx_orig: n_ctx_orig as i32,
         inverse: inverse as i32, freq_base, freq_scale, ext_factor, attn_factor,
         beta_fast, beta_slow, src2: 0, _padding: [0; 7],
     };
@@ -983,6 +991,27 @@ pub fn kv_fp8_store(
           (raw_cache.buf_ref(), raw_cache.offset_raw())],
         (1, 1, 1), (64, 1, 1),
         256) // 64 * sizeof(float) scratch for FP8 reduction
+}
+
+// ─── FP8 KV Quantize (in-place, compressor path) ────────────────────────
+
+/// In-place FP8 round-trip quantization on a single row of `head_dim` f32 values.
+/// Matches C's `ds4_gpu_dsv4_fp8_kv_quantize_tensor` (n_tok=1).
+pub fn fp8_kv_quantize(
+    x: &GpuTensor, head_dim: u32, n_rot: u32,
+) -> Result<(), &'static str> {
+    let row_bytes = head_dim as u64 * 4;
+    let args = Fp8KvQuantizeArgs {
+        ne00: head_dim as i64, ne01: 1, ne02: 1, ne03: 1,
+        nb00: 4, nb01: row_bytes, nb02: row_bytes, nb03: row_bytes,
+        nb0: 4, nb1: row_bytes, nb2: row_bytes, nb3: row_bytes,
+        n_rot: n_rot as i32,
+    };
+    dispatch_pipeline_tg("kernel_dsv4_fp8_kv_quantize_f32", &args,
+        &[(x.buf_ref(), x.offset_raw()),
+          (x.buf_ref(), x.offset_raw())],
+        (1, 1, 1), (64, 1, 1),
+        256) // 64 * sizeof(float) scratch for amax reduction
 }
 
 // ─── Compressor Store One ───────────────────────────────────────────────

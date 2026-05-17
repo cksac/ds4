@@ -107,6 +107,8 @@ pub struct GpuGraph {
     pub output_embd: GpuTensor,
     pub output_norm: GpuTensor,
     pub logits: GpuTensor,
+    pub comp_kv: GpuTensor,
+    pub comp_sc: GpuTensor,
     pub raw_cache: Vec<GpuTensor>,
     pub state_kv: Vec<GpuTensor>,
     pub state_score: Vec<GpuTensor>,
@@ -156,10 +158,13 @@ impl GpuGraph {
             output_pre: alloc(N_HC as u64 * 4), output_weights: alloc(N_HC as u64 * 4),
             output_embd: alloc(embd_bytes), output_norm: alloc(embd_bytes),
             logits: alloc(N_VOCAB as u64 * 4),
+            comp_kv: alloc(2 * N_HEAD_DIM as u64 * 4),
+            comp_sc: alloc(2 * N_HEAD_DIM as u64 * 4),
             raw_cache: (0..n).map(|_| alloc(raw_cap as u64 * N_HEAD_DIM as u64 * 4)).collect(),
-            state_kv: (0..n).map(|_| alloc(8 * N_HEAD_DIM as u64 * 4)).collect(),
-            state_score: (0..n).map(|_| alloc(8 * N_HEAD_DIM as u64 * 4)).collect(),
-            index_comp: (0..n).map(|_| alloc(raw_cap as u64 / 4 * N_INDEXER_HEAD_DIM as u64 * 4)).collect(),
+            // state_kv/state_score: max(8*2*N_HEAD_DIM, 128*N_HEAD_DIM) = 128*N_HEAD_DIM floats
+            state_kv: (0..n).map(|_| alloc(128 * N_HEAD_DIM as u64 * 4)).collect(),
+            state_score: (0..n).map(|_| alloc(128 * N_HEAD_DIM as u64 * 4)).collect(),
+            index_comp: (0..n).map(|_| alloc(raw_cap as u64 / 4 * N_HEAD_DIM as u64 * 4)).collect(),
             index_state_kv: (0..n).map(|_| alloc(8 * N_INDEXER_HEAD_DIM as u64 * 4)).collect(),
             index_state_score: (0..n).map(|_| alloc(8 * N_INDEXER_HEAD_DIM as u64 * 4)).collect(),
             n_layer: n, raw_cap, n_pos: 0, n_raw: 0, n_comp: [0u32; 43],
@@ -530,10 +535,116 @@ pub fn eval_token_decode(
         std::mem::swap(&mut graph.cur_hc, &mut graph.after_ffn_hc);
 
         if ratio != 0 {
-            // Compressor not yet implemented: n_comp[il] stays 0.
-            // When the compressor is added, increment n_comp[il] only when
-            // a compressed KV is actually written to index_comp[il].
-            let _ = ratio;
+            let coff: u32 = if ratio == 4 { 2 } else { 1 };
+            let comp_width = coff * N_HEAD_DIM;
+            let emit = ((graph.n_pos + 1) % ratio) == 0;
+
+            if let (Some(ref ck), Some(ref cg), Some(ref ca), Some(ref cn)) = (
+                lw.attn_compressor_kv.as_ref(),
+                lw.attn_compressor_gate.as_ref(),
+                lw.attn_compressor_ape.as_ref(),
+                lw.attn_compressor_norm.as_ref(),
+            ) {
+                let (ck_off, cg_off, ca_off, cn_off) =
+                    (ck.abs_offset, cg.abs_offset, ca.abs_offset, cn.abs_offset);
+
+                // Project attn_norm → comp_kv and comp_sc (gate/score)
+                ops::matmul_f16(&graph.comp_kv, views, ck_off,
+                    N_EMBD as u64, comp_width as u64, &graph.attn_norm, 1)?;
+                ops::matmul_f16(&graph.comp_sc, views, cg_off,
+                    N_EMBD as u64, comp_width as u64, &graph.attn_norm, 1)?;
+
+                // Store kv+score into state ring with APE
+                ops::compressor_store_one(
+                    &graph.comp_kv, &graph.comp_sc, views, ca_off,
+                    &graph.state_kv[il], &graph.state_score[il],
+                    comp_width, ratio, graph.n_pos,
+                )?;
+
+                if emit {
+                    let comp_row = graph.n_comp[il];
+
+                    // Flush GPU so state_kv/state_score are ready to read on CPU
+                    ops::flush_batch()?;
+
+                    // Read state buffers from CPU-visible shared memory
+                    let state_kv_bytes = graph.state_kv[il].read_bytes()?;
+                    let state_sc_bytes = graph.state_score[il].read_bytes()?;
+                    let state_kv: &[f32] = unsafe { std::slice::from_raw_parts(
+                        state_kv_bytes.as_ptr() as *const f32, state_kv_bytes.len() / 4) };
+                    let state_sc: &[f32] = unsafe { std::slice::from_raw_parts(
+                        state_sc_bytes.as_ptr() as *const f32, state_sc_bytes.len() / 4) };
+
+                    // CPU softmax pool: matches C's ds4_gpu_encode_compressor_pool
+                    // For ratio=4 (coff=2, width=2*head_dim):
+                    //   rows 0..4 use col j (first half), rows 4..8 use col head_dim+j (second half)
+                    // For ratio=128 (coff=1, width=head_dim):
+                    //   rows 0..128 use col j directly
+                    let n_rows = (coff * ratio) as usize;
+                    let head_dim = N_HEAD_DIM as usize;
+                    let width = comp_width as usize;
+
+                    let mut pool_out = vec![0.0f32; head_dim];
+                    for j in 0..head_dim {
+                        let mut kvs = vec![0.0f32; n_rows];
+                        let mut scs = vec![0.0f32; n_rows];
+                        for i in 0..n_rows {
+                            let col = if ratio == 4 {
+                                if i < 4 { j } else { head_dim + j }
+                            } else {
+                                j
+                            };
+                            kvs[i] = state_kv[i * width + col];
+                            scs[i] = state_sc[i * width + col];
+                        }
+                        // Softmax over scores
+                        let max_sc = scs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let exps: Vec<f32> = scs.iter().map(|&s| (s - max_sc).exp()).collect();
+                        let sum: f32 = exps.iter().sum();
+                        // Weighted sum of kv
+                        let val: f32 = exps.iter().zip(kvs.iter()).map(|(&w, &k)| w / sum * k).sum();
+                        pool_out[j] = val;
+                    }
+
+                    // Write pool result into comp_view (a view into index_comp[il] at this comp_row)
+                    let comp_offset = comp_row as u64 * N_HEAD_DIM as u64 * 4;
+                    let comp_view = GpuTensor::wrap(
+                        graph.index_comp[il].retain_buf().unwrap(),
+                        graph.index_comp[il].offset_raw() + comp_offset,
+                        N_HEAD_DIM as u64 * 4,
+                    );
+                    let pool_bytes: &[u8] = unsafe { std::slice::from_raw_parts(
+                        pool_out.as_ptr() as *const u8, pool_out.len() * 4) };
+                    // write_bytes expects exact size match
+                    {
+                        let ptr = (graph.index_comp[il].retain_buf().unwrap().contents().as_ptr()
+                            as usize + graph.index_comp[il].offset_raw() as usize
+                            + comp_offset as usize) as *mut u8;
+                        unsafe { std::ptr::copy_nonoverlapping(pool_bytes.as_ptr(), ptr, pool_bytes.len()); }
+                    }
+
+                    // GPU: rms_norm_weight (in-place on comp_view)
+                    ops::rms_norm_weight(&comp_view, &comp_view, views, cn_off, N_HEAD_DIM, DS4_RMS_EPS)?;
+
+                    // GPU: rope_tail with comp_pos = n_pos + 1 - ratio
+                    let comp_pos = graph.n_pos + 1 - ratio;
+                    ops::rope_tail(&comp_view, 1, 1, N_HEAD_DIM, N_ROT, comp_pos,
+                        DS4_ROPE_ORIG_CTX, false,
+                        DS4_COMPRESS_ROPE_FREQ_BASE, 1.0 / DS4_ROPE_SCALE_FACTOR,
+                        ext_factor, attn_factor,
+                        DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW)?;
+
+                    // GPU: ratio4 state shift (operates on state buffers, not comp_view)
+                    if ratio == 4 {
+                        ops::compressor_ratio4_shift(&graph.state_kv[il], &graph.state_score[il], comp_width)?;
+                    }
+
+                    // GPU: FP8 in-place quantize on comp_view
+                    ops::fp8_kv_quantize(&comp_view, N_HEAD_DIM, N_ROT)?;
+
+                    graph.n_comp[il] += 1;
+                }
+            }
         }
     }
 
@@ -548,16 +659,22 @@ pub fn eval_token_decode(
         ops::output_hc_weights(&graph.output_weights, &graph.output_pre,
             views, scale.abs_offset, base.abs_offset, N_HC, DS4_HC_EPS)?;
     }
+    // Dump output HC weights matching C: il=N_LAYER, pos=n_pos (C uses pos=0 always).
+    dump_tensor(&graph.output_pre,     "result_hc_pre",     N_HC as usize,   N_LAYER as usize, graph.n_pos);
+    dump_tensor(&graph.output_weights, "result_hc_weights", N_HC as usize,   N_LAYER as usize, graph.n_pos);
     ops::hc_weighted_sum(&graph.output_embd, &graph.cur_hc,
         &graph.output_weights, N_EMBD, N_HC)?;
+    dump_tensor(&graph.output_embd, "result_hc", N_EMBD as usize, N_LAYER as usize, graph.n_pos);
     if let Some(ref on) = weights.output_norm {
         ops::rms_norm_weight(&graph.output_norm, &graph.output_embd,
             views, on.abs_offset, N_EMBD, DS4_RMS_EPS)?;
     }
+    dump_tensor(&graph.output_norm, "result_norm", N_EMBD as usize, N_LAYER as usize, graph.n_pos);
     if let Some(ref ow) = weights.output {
         ops::matmul_q8_0(&graph.logits, views,
             ow.abs_offset, N_EMBD as u64, N_VOCAB as u64, &graph.output_norm, 1)?;
     }
+    dump_tensor(&graph.logits, "result_output", N_VOCAB as usize, N_LAYER as usize, graph.n_pos);
     graph.n_raw = (graph.n_raw + 1).min(graph.raw_cap);
     graph.n_pos += 1;
 

@@ -5144,6 +5144,176 @@ static void layer_shared_ffn_batch(
     free(gate);
 }
 
+static void layer_routed_moe_one_prealloc(
+        float                  * out,
+        const ds4_model        * model,
+        const ds4_layer_weights * layer,
+        const float            * x,
+        uint32_t                 il,
+        int                      token,
+        float                    clamp,
+        float                  * mid_all,
+        block_q8_K             * xq,
+        block_q8_K             * midq);
+static void layer_routed_moe_batch(
+        float             * out,
+        const ds4_model   * model,
+        const ds4_layer_weights * layer,
+        const float       * inp,
+        const int         * token_ids,
+        uint32_t            n_tok,
+        uint32_t            il,
+        float               clamp_exp);
+
+static void layer_ffn_one_decode_scratch(
+        float                  * out_hc,
+        const ds4_model        * model,
+        const ds4_layer_weights * layer,
+        const float            * inp_hc,
+        uint32_t                 il,
+        int                      token,
+        const float            * steering_dirs,
+        float                    steering_scale,
+        ds4_cpu_decode_scratch * scratch) {
+    const uint32_t n_hc = DS4_N_HC;
+    const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
+    const double t_start = profile ? now_sec() : 0.0;
+    double t_hc = 0.0;
+    double t_norm = 0.0;
+    double t_routed = 0.0;
+    double t_shared = 0.0;
+    double t_post = 0.0;
+    float post[4];
+    float comb[16];
+
+    double t0 = profile ? now_sec() : 0.0;
+    hc_pre_from_state_one_scratch(model,
+                                  layer->hc_ffn_fn,
+                                  layer->hc_ffn_scale,
+                                  layer->hc_ffn_base,
+                                  inp_hc, scratch->ffn_cur, post, comb,
+                                  scratch->hc_flat,
+                                  false);
+    if (profile) t_hc = now_sec() - t0;
+
+    t0 = profile ? now_sec() : 0.0;
+    const float *ffn_norm = tensor_data(model, layer->ffn_norm);
+    rms_norm_weight(scratch->ffn_norm, scratch->ffn_cur, ffn_norm, DS4_N_EMBD, DS4_RMS_EPS);
+    if (profile) t_norm = now_sec() - t0;
+
+    t0 = profile ? now_sec() : 0.0;
+    layer_routed_moe_one_prealloc(scratch->ffn_moe,
+                                  model,
+                                  layer,
+                                  scratch->ffn_norm,
+                                  il,
+                                  token,
+                                  DS4_SWIGLU_CLAMP_EXP,
+                                  scratch->routed_mid_all,
+                                  scratch->routed_xq,
+                                  scratch->routed_midq);
+    if (profile) t_routed = now_sec() - t0;
+
+    t0 = profile ? now_sec() : 0.0;
+    layer_shared_ffn_one_decode_scratch(scratch->ffn_shared, model, layer, scratch->ffn_norm, scratch);
+    if (profile) t_shared = now_sec() - t0;
+
+    t0 = profile ? now_sec() : 0.0;
+    for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+        scratch->ffn_out[i] = scratch->ffn_moe[i] + scratch->ffn_shared[i];
+    }
+    cpu_directional_steering_project_rows(scratch->ffn_out, steering_dirs, il, 1, steering_scale);
+    hc_post_one(out_hc, scratch->ffn_out, inp_hc, post, comb, DS4_N_EMBD, n_hc);
+    if (profile) t_post = now_sec() - t0;
+
+    if (profile) {
+        fprintf(stderr,
+                "ds4: decode detail layer %u ffn hc=%.3f norm=%.3f routed=%.3f shared=%.3f post=%.3f total=%.3f ms\n",
+                il,
+                t_hc * 1000.0,
+                t_norm * 1000.0,
+                t_routed * 1000.0,
+                t_shared * 1000.0,
+                t_post * 1000.0,
+                (now_sec() - t_start) * 1000.0);
+    }
+}
+
+static void layer_ffn_batch(
+        float             * out_hc,
+        const ds4_model   * model,
+        const ds4_layer_weights * layer,
+        const float       * inp_hc,
+        const int         * token_ids,
+        uint32_t            n_tok,
+        uint32_t            il,
+        const float       * steering_dirs,
+        float               steering_scale) {
+    if (n_tok == 0) return;
+    const uint32_t n_hc = DS4_N_HC;
+    const uint64_t hc_dim = (uint64_t)n_hc * DS4_N_EMBD;
+    float *ffn_cur = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));
+    float *norm = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(norm[0]));
+    float *moe = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(moe[0]));
+    float *shared = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
+    float *post = xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
+    float *comb = xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
+    const float *ffn_norm = tensor_data(model, layer->ffn_norm);
+
+    for (uint32_t t = 0; t < n_tok; t++) {
+        hc_pre_from_state_one(model,
+                              layer->hc_ffn_fn,
+                              layer->hc_ffn_scale,
+                              layer->hc_ffn_base,
+                              inp_hc + (uint64_t)t * hc_dim,
+                              ffn_cur + (uint64_t)t * DS4_N_EMBD,
+                              post + (uint64_t)t * n_hc,
+                              comb + (uint64_t)t * n_hc * n_hc);
+        rms_norm_weight(norm + (uint64_t)t * DS4_N_EMBD,
+                        ffn_cur + (uint64_t)t * DS4_N_EMBD,
+                        ffn_norm,
+                        DS4_N_EMBD,
+                        DS4_RMS_EPS);
+    }
+
+    layer_routed_moe_batch(moe, model, layer, norm, token_ids, n_tok, il, DS4_SWIGLU_CLAMP_EXP);
+    layer_shared_ffn_batch(shared, model, layer, norm, n_tok);
+
+    if (cpu_directional_steering_enabled(steering_dirs, steering_scale)) {
+        float *ffn_out = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_out[0]));
+        for (uint64_t i = 0; i < (uint64_t)n_tok * DS4_N_EMBD; i++) {
+            ffn_out[i] = moe[i] + shared[i];
+        }
+        cpu_directional_steering_project_rows(ffn_out, steering_dirs, il, n_tok, steering_scale);
+        hc_post_batch(out_hc,
+                      ffn_out,
+                      inp_hc,
+                      post,
+                      comb,
+                      n_tok,
+                      DS4_N_EMBD,
+                      n_hc);
+        free(ffn_out);
+    } else {
+        hc_post_sum_batch(out_hc,
+                          moe,
+                          shared,
+                          inp_hc,
+                          post,
+                          comb,
+                          n_tok,
+                          DS4_N_EMBD,
+                          n_hc);
+    }
+
+    free(comb);
+    free(post);
+    free(shared);
+    free(moe);
+    free(norm);
+    free(ffn_cur);
+}
+
 /* Early DS4 layers use token-id hash routing instead of top-k routing. */
 static void layer_hash_selected_experts(
         int                    selected[DS4_N_EXPERT_USED],
@@ -5675,381 +5845,6 @@ static void layer_ffn_one(
     free(moe);
     free(norm);
     free(ffn_cur);
-}
-
-/* Allocation-free decode FFN using the persistent CPU scratch buffers. */
-static void layer_ffn_one_decode_scratch(
-        float                  * out_hc,
-        const ds4_model        * model,
-        const ds4_layer_weights * layer,
-        const float            * inp_hc,
-        uint32_t                 il,
-        int                      token,
-        const float            * steering_dirs,
-        float                    steering_scale,
-        ds4_cpu_decode_scratch * scratch) {
-    const uint32_t n_hc = DS4_N_HC;
-    const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
-    const double t_start = profile ? now_sec() : 0.0;
-    double t_hc = 0.0;
-    double t_norm = 0.0;
-    double t_routed = 0.0;
-    double t_shared = 0.0;
-    double t_post = 0.0;
-    float post[4];
-    float comb[16];
-
-    double t0 = profile ? now_sec() : 0.0;
-    hc_pre_from_state_one_scratch(model,
-                                  layer->hc_ffn_fn,
-                                  layer->hc_ffn_scale,
-                                  layer->hc_ffn_base,
-                                  inp_hc, scratch->ffn_cur, post, comb,
-                                  scratch->hc_flat,
-                                  false);
-    if (profile) t_hc = now_sec() - t0;
-
-    t0 = profile ? now_sec() : 0.0;
-    const float *ffn_norm = tensor_data(model, layer->ffn_norm);
-    rms_norm_weight(scratch->ffn_norm, scratch->ffn_cur, ffn_norm, DS4_N_EMBD, DS4_RMS_EPS);
-    if (profile) t_norm = now_sec() - t0;
-
-    t0 = profile ? now_sec() : 0.0;
-    layer_routed_moe_one_prealloc(scratch->ffn_moe,
-                                  model,
-                                  layer,
-                                  scratch->ffn_norm,
-                                  il,
-                                  token,
-                                  DS4_SWIGLU_CLAMP_EXP,
-                                  scratch->routed_mid_all,
-                                  scratch->routed_xq,
-                                  scratch->routed_midq);
-    if (profile) t_routed = now_sec() - t0;
-
-    t0 = profile ? now_sec() : 0.0;
-    layer_shared_ffn_one_decode_scratch(scratch->ffn_shared, model, layer, scratch->ffn_norm, scratch);
-    if (profile) t_shared = now_sec() - t0;
-
-    t0 = profile ? now_sec() : 0.0;
-    for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
-        scratch->ffn_out[i] = scratch->ffn_moe[i] + scratch->ffn_shared[i];
-    }
-    cpu_directional_steering_project_rows(scratch->ffn_out, steering_dirs, il, 1, steering_scale);
-    hc_post_one(out_hc, scratch->ffn_out, inp_hc, post, comb, DS4_N_EMBD, n_hc);
-    if (profile) t_post = now_sec() - t0;
-
-    if (profile) {
-        fprintf(stderr,
-                "ds4: decode detail layer %u ffn hc=%.3f norm=%.3f routed=%.3f shared=%.3f post=%.3f total=%.3f ms\n",
-                il,
-                t_hc * 1000.0,
-                t_norm * 1000.0,
-                t_routed * 1000.0,
-                t_shared * 1000.0,
-                t_post * 1000.0,
-                (now_sec() - t_start) * 1000.0);
-    }
-}
-
-static void layer_ffn_batch(
-        float             * out_hc,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
-        const float       * inp_hc,
-        const int         * token_ids,
-        uint32_t            n_tok,
-        uint32_t            il,
-        const float       * steering_dirs,
-        float               steering_scale) {
-    if (n_tok == 0) return;
-    const uint32_t n_hc = DS4_N_HC;
-    const uint64_t hc_dim = (uint64_t)n_hc * DS4_N_EMBD;
-    float *ffn_cur = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));
-    float *norm = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(norm[0]));
-    float *moe = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(moe[0]));
-    float *shared = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
-    float *post = xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
-    float *comb = xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
-    const float *ffn_norm = tensor_data(model, layer->ffn_norm);
-
-    for (uint32_t t = 0; t < n_tok; t++) {
-        hc_pre_from_state_one(model,
-                              layer->hc_ffn_fn,
-                              layer->hc_ffn_scale,
-                              layer->hc_ffn_base,
-                              inp_hc + (uint64_t)t * hc_dim,
-                              ffn_cur + (uint64_t)t * DS4_N_EMBD,
-                              post + (uint64_t)t * n_hc,
-                              comb + (uint64_t)t * n_hc * n_hc);
-        rms_norm_weight(norm + (uint64_t)t * DS4_N_EMBD,
-                        ffn_cur + (uint64_t)t * DS4_N_EMBD,
-                        ffn_norm,
-                        DS4_N_EMBD,
-                        DS4_RMS_EPS);
-    }
-
-    layer_routed_moe_batch(moe, model, layer, norm, token_ids, n_tok, il, DS4_SWIGLU_CLAMP_EXP);
-    layer_shared_ffn_batch(shared, model, layer, norm, n_tok);
-
-    if (cpu_directional_steering_enabled(steering_dirs, steering_scale)) {
-        float *ffn_out = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_out[0]));
-        for (uint64_t i = 0; i < (uint64_t)n_tok * DS4_N_EMBD; i++) {
-            ffn_out[i] = moe[i] + shared[i];
-        }
-        cpu_directional_steering_project_rows(ffn_out, steering_dirs, il, n_tok, steering_scale);
-        hc_post_batch(out_hc,
-                      ffn_out,
-                      inp_hc,
-                      post,
-                      comb,
-                      n_tok,
-                      DS4_N_EMBD,
-                      n_hc);
-        free(ffn_out);
-    } else {
-        hc_post_sum_batch(out_hc,
-                          moe,
-                          shared,
-                          inp_hc,
-                          post,
-                          comb,
-                          n_tok,
-                          DS4_N_EMBD,
-                          n_hc);
-    }
-
-    free(comb);
-    free(post);
-    free(shared);
-    free(moe);
-    free(norm);
-    free(ffn_cur);
-}
-
-typedef struct {
-    float *moe;
-    const ds4_model *model;
-    const ds4_layer_weights *layer;
-    const float *norm;
-    const int *token_ids;
-    uint64_t expert_in_dim;
-    uint64_t down_in_dim;
-    uint32_t il;
-} routed_moe_tokens_ctx;
-
-static void routed_moe_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
-    routed_moe_tokens_ctx *ctx = vctx;
-    float *routed_mid = xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(routed_mid[0]));
-    block_q8_K *routed_xq = xmalloc((size_t)(ctx->expert_in_dim / QK_K) * sizeof(routed_xq[0]));
-    block_q8_K *routed_midq = xmalloc((size_t)DS4_N_EXPERT_USED * (ctx->down_in_dim / QK_K) * sizeof(routed_midq[0]));
-
-    for (uint64_t t = t0; t < t1; t++) {
-        layer_routed_moe_one_prealloc(ctx->moe + t * DS4_N_EMBD,
-                                      ctx->model,
-                                      ctx->layer,
-                                      ctx->norm + t * DS4_N_EMBD,
-                                      ctx->il,
-                                      ctx->token_ids[t],
-                                      DS4_SWIGLU_CLAMP_EXP,
-                                      routed_mid,
-                                      routed_xq,
-                                      routed_midq);
-    }
-
-    free(routed_midq);
-    free(routed_xq);
-    free(routed_mid);
-}
-
-static void layer_routed_moe_tokens_parallel(
-        float             * moe,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
-        const float       * norm,
-        const int         * token_ids,
-        uint32_t            n_tok,
-        uint32_t            il) {
-    routed_moe_tokens_ctx ctx = {
-        .moe = moe,
-        .model = model,
-        .layer = layer,
-        .norm = norm,
-        .token_ids = token_ids,
-        .expert_in_dim = layer->ffn_gate_exps->dim[0],
-        .down_in_dim = layer->ffn_down_exps->dim[0],
-        .il = il,
-    };
-    ds4_parallel_for_min_rows(n_tok, routed_moe_tokens_worker, &ctx, 1);
-}
-
-/* Default prefill FFN path.  HC and shared expert are batched, while routed
- * experts can run either token-parallel or expert-grouped depending on size. */
-static void layer_ffn_shared_batch(
-        float             * out_hc,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
-        const float       * inp_hc,
-        const int         * token_ids,
-        uint32_t            n_tok,
-        uint32_t            il,
-        const float       * steering_dirs,
-        float               steering_scale) {
-    const bool profile = getenv("DS4_PREFILL_PROFILE_DETAIL") != NULL;
-    const double t_start = profile ? now_sec() : 0.0;
-    double t_hc_norm = 0.0;
-    double t_routed = 0.0;
-    double t_shared = 0.0;
-    double t_post = 0.0;
-    const uint32_t n_hc = DS4_N_HC;
-    float *ffn_cur = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));
-    float *norm = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(norm[0]));
-    float *moe = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(moe[0]));
-    float *shared = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
-    float *post = xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
-    float *comb = xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
-    const bool routed_token_parallel =
-        getenv("DS4_ROUTED_TOKEN_PARALLEL") != NULL ||
-        (getenv("DS4_NO_ROUTED_TOKEN_PARALLEL") == NULL && n_tok >= 64);
-    float *routed_mid = routed_token_parallel ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(routed_mid[0]));
-    block_q8_K *routed_xq = routed_token_parallel ? NULL : xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(routed_xq[0]));
-    block_q8_K *routed_midq = routed_token_parallel ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(routed_midq[0]));
-
-    double t0 = profile ? now_sec() : 0.0;
-    hc_pre_norm_batch(model,
-                      layer->hc_ffn_fn,
-                      layer->hc_ffn_scale,
-                      layer->hc_ffn_base,
-                      layer->ffn_norm,
-                      inp_hc,
-                      NULL,
-                      ffn_cur,
-                      norm,
-                      post,
-                      comb,
-                      n_tok);
-    if (profile) t_hc_norm = now_sec() - t0;
-
-    t0 = profile ? now_sec() : 0.0;
-    if (routed_token_parallel) {
-        layer_routed_moe_tokens_parallel(moe, model, layer, norm, token_ids, n_tok, il);
-    } else {
-        for (uint32_t t = 0; t < n_tok; t++) {
-            layer_routed_moe_one_prealloc(moe + (uint64_t)t * DS4_N_EMBD,
-                                          model,
-                                          layer,
-                                          norm + (uint64_t)t * DS4_N_EMBD,
-                                          il,
-                                          token_ids[t],
-                                          DS4_SWIGLU_CLAMP_EXP,
-                                          routed_mid,
-                                          routed_xq,
-                                          routed_midq);
-        }
-    }
-    if (profile) t_routed = now_sec() - t0;
-
-    t0 = profile ? now_sec() : 0.0;
-    layer_shared_ffn_batch(shared, model, layer, norm, n_tok);
-    if (profile) t_shared = now_sec() - t0;
-
-    t0 = profile ? now_sec() : 0.0;
-    if (cpu_directional_steering_enabled(steering_dirs, steering_scale)) {
-        float *ffn_out = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_out[0]));
-        for (uint64_t i = 0; i < (uint64_t)n_tok * DS4_N_EMBD; i++) {
-            ffn_out[i] = moe[i] + shared[i];
-        }
-        cpu_directional_steering_project_rows(ffn_out, steering_dirs, il, n_tok, steering_scale);
-        hc_post_batch(out_hc,
-                      ffn_out,
-                      inp_hc,
-                      post,
-                      comb,
-                      n_tok,
-                      DS4_N_EMBD,
-                      n_hc);
-        free(ffn_out);
-    } else {
-        hc_post_sum_batch(out_hc,
-                          moe,
-                          shared,
-                          inp_hc,
-                          post,
-                          comb,
-                          n_tok,
-                          DS4_N_EMBD,
-                          n_hc);
-    }
-    if (profile) t_post = now_sec() - t0;
-
-    if (profile) {
-        fprintf(stderr,
-                "ds4: prefill detail layer %u ffn hc_norm=%.3f routed=%.3f shared=%.3f post=%.3f total=%.3f\n",
-                il, t_hc_norm, t_routed, t_shared, t_post, now_sec() - t_start);
-    }
-
-    free(comb);
-    free(post);
-    free(routed_midq);
-    free(routed_xq);
-    free(routed_mid);
-    free(shared);
-    free(moe);
-    free(norm);
-    free(ffn_cur);
-}
-
-typedef struct {
-    float *out_hc;
-    const ds4_model *model;
-    const ds4_layer_weights *layer;
-    const float *inp_hc;
-    const int *token_ids;
-    const float *steering_dirs;
-    float steering_scale;
-    uint64_t hc_dim;
-    uint32_t il;
-} layer_ffn_tokens_ctx;
-
-static void layer_ffn_tokens_worker(void *vctx, uint64_t t0, uint64_t t1) {
-    layer_ffn_tokens_ctx *ctx = vctx;
-    for (uint64_t t = t0; t < t1; t++) {
-        layer_ffn_one(ctx->out_hc + t * ctx->hc_dim,
-                      ctx->model,
-                      ctx->layer,
-                      ctx->inp_hc + t * ctx->hc_dim,
-                      ctx->il,
-                      ctx->token_ids[t],
-                      ctx->steering_dirs,
-                      ctx->steering_scale,
-                      false);
-    }
-}
-
-static void layer_ffn_tokens_parallel(
-        float             * out_hc,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
-        const float       * inp_hc,
-        const int         * token_ids,
-        uint32_t            n_tok,
-        uint32_t            il,
-        const float       * steering_dirs,
-        float               steering_scale) {
-    layer_ffn_tokens_ctx ctx = {
-        .out_hc = out_hc,
-        .model = model,
-        .layer = layer,
-        .inp_hc = inp_hc,
-        .token_ids = token_ids,
-        .steering_dirs = steering_dirs,
-        .steering_scale = steering_scale,
-        .hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD,
-        .il = il,
-    };
-    ds4_parallel_for(n_tok, layer_ffn_tokens_worker, &ctx);
 }
 
 static void output_logits_one(
@@ -6976,117 +6771,6 @@ static bool *indexer_allowed_decode_one_decode_scratch(
     return allowed;
 }
 
-/* Single-token attention sublayer with raw SWA cache and DS4 compression. */
-static void layer_attention_raw_swa_one(
-        float                   * after_attn_hc,
-        const ds4_model         * model,
-        const ds4_layer_weights * layer,
-        ds4_layer_cache         * cache,
-        const float             * inp_hc,
-        uint32_t                  il,
-        uint32_t                  pos,
-        const float             * steering_dirs,
-        float                     steering_scale) {
-    const uint32_t n_hc = DS4_N_HC;
-    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-
-    float *attn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(attn_cur[0]));
-    float *attn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(attn_norm[0]));
-    float *attn_residual = xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(attn_residual[0]));
-    float *q = xmalloc((size_t)q_dim * sizeof(q[0]));
-    float *qr_norm = xmalloc(1024 * sizeof(qr_norm[0]));
-    float *kv = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(kv[0]));
-    float *heads = xmalloc((size_t)q_dim * sizeof(heads[0]));
-    float *attn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(attn_out[0]));
-    bool *comp_allowed = NULL;
-    float post[4];
-    float comb[16];
-
-    memcpy(attn_residual, inp_hc, (size_t)n_hc * DS4_N_EMBD * sizeof(inp_hc[0]));
-    hc_pre_from_state_one(model,
-                          layer->hc_attn_fn,
-                          layer->hc_attn_scale,
-                          layer->hc_attn_base,
-                          attn_residual, attn_cur, post, comb);
-
-    layer_attn_norm_one(attn_norm, model, layer, attn_cur);
-    layer_q_projection_with_lora_one(model, layer, attn_norm, q, qr_norm);
-    layer_kv_projection_normed_one(model, layer, attn_norm, kv);
-
-    rope_tail_layer_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
-    rope_tail_layer_inplace(kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
-    dsv4_fp8_kv_quantize_row_inplace_cpu(kv, DS4_N_HEAD_DIM, DS4_N_ROT);
-
-    kv_cache_push_raw(cache, kv);
-
-    const uint32_t ratio = cache->compress_ratio;
-    if (ratio != 0) {
-        float *comp = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(comp[0]));
-        if (compressor_decode_one(comp, model,
-                                  layer->attn_compressor_kv,
-                                  layer->attn_compressor_gate,
-                                  layer->attn_compressor_ape,
-                                  layer->attn_compressor_norm,
-                                  attn_norm,
-                                  cache->attn_state_kv,
-                                  cache->attn_state_score,
-                                  DS4_N_HEAD_DIM,
-                                  ratio,
-                                  il,
-                                  pos)) {
-            kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp, cache->comp_cap, DS4_N_HEAD_DIM, comp);
-        }
-        free(comp);
-
-        if (ratio == 4) {
-            float *index_comp = xmalloc((size_t)DS4_N_INDEXER_HEAD_DIM * sizeof(index_comp[0]));
-            if (compressor_decode_one(index_comp, model,
-                                      layer->indexer_compressor_kv,
-                                      layer->indexer_compressor_gate,
-                                      layer->indexer_compressor_ape,
-                                      layer->indexer_compressor_norm,
-                                      attn_norm,
-                                      cache->index_state_kv,
-                                      cache->index_state_score,
-                                      DS4_N_INDEXER_HEAD_DIM,
-                                      ratio,
-                                      il,
-                                      pos)) {
-                kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp, cache->comp_cap, DS4_N_INDEXER_HEAD_DIM, index_comp);
-            }
-            free(index_comp);
-
-            comp_allowed = indexer_allowed_decode_one(model, layer,
-                                                      attn_norm, qr_norm,
-                                                      cache->index_comp_kv,
-                                                      cache->n_index_comp,
-                                                      il, pos);
-        }
-
-        layer_attention_mixed_one(heads, model, layer, q,
-                                  cache->raw_kv, cache->n_raw,
-                                  cache->attn_comp_kv, cache->n_comp,
-                                  comp_allowed);
-    } else {
-        layer_attention_rows_one(heads, model, layer, q, cache->raw_kv, cache->n_raw);
-    }
-
-    rope_tail_layer_inplace(heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, true);
-    layer_grouped_out_one(attn_out, model, layer, heads);
-    cpu_directional_steering_project_rows(attn_out, steering_dirs, il, 1, steering_scale);
-    hc_post_one(after_attn_hc, attn_out, attn_residual, post, comb, DS4_N_EMBD, n_hc);
-
-    free(comp_allowed);
-    free(attn_out);
-    free(heads);
-    free(kv);
-    free(qr_norm);
-    free(q);
-    free(attn_residual);
-    free(attn_norm);
-    free(attn_cur);
-}
-
 /* Batched prefill attention.  It projects Q/KV for all tokens, streams them
  * through the same raw/compressed cache updates, then runs prefix attention. */
 static void layer_attention_raw_swa_batch(
@@ -7687,16 +7371,12 @@ static void prefill_layer_major_cpu(
     float *attn = xmalloc((size_t)n_tok * hc_dim * sizeof(attn[0]));
     float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(plain[0]));
     uint32_t ffn_batch = 128;
-    const bool batched_attn = getenv("DS4_NO_BATCHED_ATTN") == NULL;
-    const bool batched_ffn = getenv("DS4_BATCHED_FFN") != NULL;
-    const bool parallel_ffn = getenv("DS4_PARALLEL_FFN") != NULL;
-    const bool shared_batch_ffn = getenv("DS4_NO_SHARED_BATCH_FFN") == NULL;
-    const char *batch_env = getenv("DS4_PREFILL_BATCH");
-    ds4_cpu_decode_scratch decode_scratch;
-    bool decode_scratch_ready = false;
-    if (batch_env && batch_env[0]) {
-        long v = strtol(batch_env, NULL, 10);
-        if (v > 0 && v < 4096) ffn_batch = (uint32_t)v;
+    {
+        const char *env = getenv("DS4_PREFILL_BATCH");
+        if (env && env[0]) {
+            long v = strtol(env, NULL, 10);
+            if (v > 0 && v < 4096) ffn_batch = (uint32_t)v;
+        }
     }
 
     for (uint64_t t = 0; t < n_tok; t++) {
@@ -7710,108 +7390,28 @@ static void prefill_layer_major_cpu(
         fprintf(stderr, "ds4: prefill layer %u/%u\r", il + 1, (uint32_t)DS4_N_LAYER);
         fflush(stderr);
 
-        if (batched_attn) {
-            layer_attention_raw_swa_batch(attn,
-                                          model,
-                                          &weights->layer[il],
-                                          &cache->layer[il],
-                                          cur,
-                                          (uint32_t)n_tok,
-                                          il,
-                                          0,
-                                          steering_dirs,
-                                          steering_attn_scale);
+        layer_attention_raw_swa_batch(attn,
+                                      model,
+                                      &weights->layer[il],
+                                      &cache->layer[il],
+                                      cur,
+                                      (uint32_t)n_tok,
+                                      il,
+                                      0,
+                                      steering_dirs,
+                                      steering_attn_scale);
 
-            if (batched_ffn) {
-                for (uint64_t t = 0; t < n_tok; t += ffn_batch) {
-                    uint32_t nb = (uint32_t)((n_tok - t) < ffn_batch ? (n_tok - t) : ffn_batch);
-                    layer_ffn_batch(next + t * hc_dim,
-                                    model,
-                                    &weights->layer[il],
-                                    attn + t * hc_dim,
-                                    prompt->v + t,
-                                    nb,
-                                    il,
-                                    steering_dirs,
-                                    steering_ffn_scale);
-                }
-            } else if (shared_batch_ffn) {
-                layer_ffn_shared_batch(next,
-                                       model,
-                                       &weights->layer[il],
-                                       attn,
-                                       prompt->v,
-                                       (uint32_t)n_tok,
-                                       il,
-                                       steering_dirs,
-                                       steering_ffn_scale);
-            } else if (parallel_ffn) {
-                layer_ffn_tokens_parallel(next,
-                                          model,
-                                          &weights->layer[il],
-                                          attn,
-                                          prompt->v,
-                                          (uint32_t)n_tok,
-                                          il,
-                                          steering_dirs,
-                                          steering_ffn_scale);
-            } else {
-                for (uint64_t t = 0; t < n_tok; t++) {
-                    layer_ffn_one(next + t * hc_dim,
-                                  model,
-                                  &weights->layer[il],
-                                  attn + t * hc_dim,
-                                  il,
-                                  prompt->v[t],
-                                  steering_dirs,
-                                  steering_ffn_scale,
-                                  false);
-                }
-            }
-        } else if (batched_ffn) {
-            for (uint64_t t = 0; t < n_tok; t++) {
-                layer_attention_raw_swa_one(attn + t * hc_dim,
-                                            model,
-                                            &weights->layer[il],
-                                            &cache->layer[il],
-                                            cur + t * hc_dim,
-                                            il,
-                                            (uint32_t)t,
-                                            steering_dirs,
-                                            steering_attn_scale);
-            }
-
-            for (uint64_t t = 0; t < n_tok; t += ffn_batch) {
-                uint32_t nb = (uint32_t)((n_tok - t) < ffn_batch ? (n_tok - t) : ffn_batch);
-                layer_ffn_batch(next + t * hc_dim,
-                                model,
-                                &weights->layer[il],
-                                attn + t * hc_dim,
-                                prompt->v + t,
-                                nb,
-                                il,
-                                steering_dirs,
-                                steering_ffn_scale);
-            }
-        } else {
-            if (!decode_scratch_ready) {
-                cpu_decode_scratch_init(&decode_scratch, (uint32_t)n_tok);
-                decode_scratch_ready = true;
-            }
-            for (uint64_t t = 0; t < n_tok; t++) {
-                layer_forward_raw_swa_one(next + t * hc_dim,
-                                          model,
-                                          &weights->layer[il],
-                                          &cache->layer[il],
-                                          cur + t * hc_dim,
-                                          il,
-                                          (uint32_t)t,
-                                          prompt->v[t],
-                                          steering_dirs,
-                                          steering_attn_scale,
-                                          steering_ffn_scale,
-                                          &decode_scratch);
-            }
+        for (uint64_t t = 0; t < n_tok; t += ffn_batch) {
+            uint32_t nb = (uint32_t)((n_tok - t) < ffn_batch ? (n_tok - t) : ffn_batch);
+            layer_ffn_batch(next + t * hc_dim,
+                            model,
+                            &weights->layer[il],
+                            attn + t * hc_dim,
+                            prompt->v + t,
+                            nb,
+                            il,
+                            steering_dirs,
+                            steering_ffn_scale);
         }
 
         float *tmp = cur;
@@ -7825,7 +7425,6 @@ static void prefill_layer_major_cpu(
         output_logits_one(logits, model, weights, cur + (n_tok - 1) * hc_dim);
     }
 
-    if (decode_scratch_ready) cpu_decode_scratch_free(&decode_scratch);
     free(next);
     free(cur);
     free(attn);
