@@ -125,4 +125,8 @@ pub struct RunArgs {
     /// Compare CPU and GPU graph logits for full prompt
     #[arg(long = "metal-graph-prompt-test")]
     pub metal_graph_prompt_test: bool,
+
+    /// Use native Rust Metal session for inference (instead of C engine)
+    #[arg(long = "native")]
+    pub native: bool,
 }

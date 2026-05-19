@@ -36,10 +36,11 @@ impl CommandBatch {
 
     pub fn compute_encoder(&mut self, cb: &AnyObject, is_batch: bool) -> Result<Retained<AnyObject>> {
         if is_batch {
-            if self.batch_enc.is_none() {
-                self.batch_enc = Some(unsafe { objc_ext::cb_compute_command_encoder(cb) });
-            }
-            Ok(self.batch_enc.as_ref().unwrap().clone())
+            // End previous batch encoder before creating a new one (like C code does)
+            self.close_batch_encoder();
+            let enc = unsafe { objc_ext::cb_compute_command_encoder(cb) };
+            self.batch_enc = Some(enc.clone());
+            Ok(enc)
         } else {
             Ok(unsafe { objc_ext::cb_compute_command_encoder(cb) })
         }

@@ -114,19 +114,116 @@ pub fn main(args: RunArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Initialize native Rust Metal session if --native flag
+    let mut native_session: Option<super::native::NativeSession> = None;
+    if args.native {
+        eprintln!("ds4: --native flag set, initializing Rust Metal session");
+
+        // mmap model independently (avoids sharing MTLBuffer with C engine)
+        let model_file = std::fs::File::open(&args.model_path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&model_file)? };
+        let map = mmap.as_ptr() as *const std::ffi::c_void;
+        let size = mmap.len() as u64;
+
+        // Use hardcoded DS4 Flash geometry
+        let n_layer = 43u32; let n_embd = 4096u32; let n_hc = 4u32;
+        let n_head = 64u32; let head_dim = 512u32; let n_rot = 64u32;
+        let n_vocab = unsafe { ffi::ds4_bridge_n_vocab(engine) } as u32;
+
+        // Tensor data starts after GGUF metadata (~5 MiB)
+        let td_off = 5u64 * 1024 * 1024 + 80 * 1024;
+        let td_size = size - td_off;
+
+        eprintln!("ds4: model map={:p} size={:.2} GiB n_vocab={}",
+            map, size as f64 / (1024.0*1024.0*1024.0), n_vocab);
+
+        match super::native::NativeSession::init_from_engine(
+            engine, map, size, td_off, td_size, args.ctx_size,
+            n_layer, n_embd, n_hc, n_head, head_dim, n_rot, n_vocab,
+        ) {
+            Ok(ns) => {
+                eprintln!("ds4: Rust Metal session created — using native inference path");
+                std::mem::forget(mmap); // keep mmap alive
+                native_session = Some(ns);
+            }
+            Err(e) => {
+                eprintln!("ds4: Rust session init failed: {} — falling back to C engine", e);
+                drop(mmap);
+            }
+        }
+    }
+
     if args.prompt.is_none() && args.prompt_file.is_none() {
-        // Interactive REPL
-        super::repl::run_repl(engine, &args)?;
+        super::repl::run_repl(engine, &args, native_session.as_mut())?;
     } else {
-        // One-shot generation
-        run_generation(engine, &args)?;
+        run_generation(engine, &args, native_session.as_mut())?;
     }
 
     unsafe { ffi::ds4_engine_close(engine) };
     Ok(())
 }
 
-fn run_generation(engine: *mut ffi::ds4_engine, args: &RunArgs) -> anyhow::Result<()> {
+fn run_generation(engine: *mut ffi::ds4_engine, args: &RunArgs, native: Option<&mut super::native::NativeSession>) -> anyhow::Result<()> {
+    if let Some(ns) = native {
+        return run_generation_native(engine, args, ns);
+    }
+    run_generation_ffi(engine, args)
+}
+
+fn run_generation_native(engine: *mut ffi::ds4_engine, args: &RunArgs, ns: &mut super::native::NativeSession) -> anyhow::Result<()> {
+    let think_mode = match args.think_mode.as_str() {
+        "nothink" => ffi::ds4_think_mode::DS4_THINK_NONE,
+        "think" => ffi::ds4_think_mode::DS4_THINK_HIGH,
+        "think-max" => ffi::ds4_think_mode::DS4_THINK_MAX,
+        _ => ffi::ds4_think_mode::DS4_THINK_HIGH,
+    };
+    let effective_think = unsafe { ffi::ds4_think_mode_for_context(think_mode, args.ctx_size) };
+
+    let mut tokens: ffi::ds4_tokens = ffi::ds4_tokens { v: std::ptr::null_mut(), len: 0, cap: 0 };
+    let system = CString::new(args.system.as_str())?;
+    let prompt_text = args.prompt.as_deref().or(args.prompt_file.as_deref()).unwrap_or("");
+    let prompt_c = CString::new(prompt_text)?;
+    unsafe { ffi::ds4_encode_chat_prompt(engine, system.as_ptr(), prompt_c.as_ptr(), effective_think, &mut tokens); }
+
+    // Sync: eval all prompt tokens into the Rust session
+    let n_prompt = tokens.len as usize;
+    let mut logits: &[f32] = &[];
+    for i in 0..n_prompt {
+        let token = unsafe { *tokens.v.add(i) };
+        logits = ns.decode(token)?;
+    }
+
+    let eos_token = unsafe { ffi::ds4_token_eos(engine) };
+    let mut rng_state: u64 = args.seed.unwrap_or_else(|| {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
+    });
+    let use_color = std::io::stdout().is_terminal();
+    let mut printer = super::printer::TokenPrinter::new(Box::new(std::io::stdout()), use_color);
+
+    for _ in 0..args.n_predict {
+        let token = if args.temperature < 0.001 {
+            super::native::NativeSession::argmax(logits)
+        } else {
+            super::native::NativeSession::sample(logits, args.temperature, args.top_p, args.min_p, &mut rng_state)
+        };
+
+        if token == eos_token { break; }
+
+        let mut text_len: usize = 0;
+        let text_ptr = unsafe { ffi::ds4_token_text(engine, token, &mut text_len) };
+        if !text_ptr.is_null() && text_len > 0 {
+            let text = unsafe { std::slice::from_raw_parts(text_ptr as *const u8, text_len) };
+            printer.process(text, false)?;
+        }
+
+        logits = ns.decode(token)?;
+    }
+    printer.finish()?;
+    unsafe { ffi::ds4_tokens_free(&mut tokens) };
+    Ok(())
+}
+
+fn run_generation_ffi(engine: *mut ffi::ds4_engine, args: &RunArgs) -> anyhow::Result<()> {
     let think_mode = match args.think_mode.as_str() {
         "nothink" => ffi::ds4_think_mode::DS4_THINK_NONE,
         "think" => ffi::ds4_think_mode::DS4_THINK_HIGH,

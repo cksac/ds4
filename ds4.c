@@ -18266,3 +18266,192 @@ int ds4_session_pos(ds4_session *s) {
 int ds4_session_ctx(ds4_session *s) {
     return s->ctx_size;
 }
+
+/* =========================================================================
+ * Native Rust Metal Bridge — exposes model internals for the Rust session.
+ * ========================================================================= */
+
+#include "ds4_bridge.h"
+
+const void *ds4_bridge_model_map(const ds4_engine *e) {
+    return e->model.map;
+}
+
+uint64_t ds4_bridge_model_size(const ds4_engine *e) {
+    return e->model.size;
+}
+
+uint64_t ds4_bridge_tensor_data_offset(const ds4_engine *e) {
+    return e->model.tensor_data_pos;
+}
+
+uint64_t ds4_bridge_tensor_data_size(const ds4_engine *e) {
+    return e->model.tensor_data_pos > e->model.size ? 0
+        : e->model.size - e->model.tensor_data_pos;
+}
+
+int ds4_bridge_n_layer(const ds4_engine *e) {
+    (void)e;
+    return (int)DS4_N_LAYER;
+}
+
+int ds4_bridge_n_embd(const ds4_engine *e) {
+    (void)e;
+    return (int)DS4_N_EMBD;
+}
+
+int ds4_bridge_n_hc(const ds4_engine *e) {
+    (void)e;
+    return (int)DS4_N_HC;
+}
+
+int ds4_bridge_n_head(const ds4_engine *e) {
+    (void)e;
+    return (int)DS4_N_HEAD;
+}
+
+int ds4_bridge_head_dim(const ds4_engine *e) {
+    (void)e;
+    return (int)DS4_N_HEAD_DIM;
+}
+
+int ds4_bridge_n_rot(const ds4_engine *e) {
+    (void)e;
+    return (int)DS4_N_ROT;
+}
+
+int ds4_bridge_n_vocab(const ds4_engine *e) {
+    return e->vocab.n_vocab;
+}
+
+int ds4_bridge_layer_weights(const ds4_engine *e, int il,
+    uint64_t *attn_norm,
+    uint64_t *attn_q_a, uint64_t *attn_q_b, uint64_t *attn_kv,
+    uint64_t *attn_out_a, uint64_t *attn_out_b,
+    uint64_t *hc_attn_fn, uint64_t *hc_attn_scale, uint64_t *hc_attn_base,
+    uint64_t *hc_ffn_fn, uint64_t *hc_ffn_scale, uint64_t *hc_ffn_base,
+    uint64_t *ffn_norm,
+    uint64_t *ffn_gate_shexp, uint64_t *ffn_up_shexp, uint64_t *ffn_down_shexp,
+    uint64_t *ffn_gate_exps, uint64_t *ffn_up_exps, uint64_t *ffn_down_exps,
+    int *ffn_gate_type, int *ffn_down_type,
+    uint64_t *ffn_gate_expert_bytes, uint64_t *ffn_gate_row_bytes,
+    uint64_t *ffn_down_expert_bytes, uint64_t *ffn_down_row_bytes,
+    int *ffn_expert_in_dim, int *ffn_expert_mid_dim, int *ffn_expert_out_dim,
+    int *compress_ratio,
+    uint64_t *compress_ape, int *compress_ape_type,
+    uint64_t *compress_norm, int *compress_norm_type,
+    float *rope_freq_base, float *rope_freq_scale,
+    uint64_t *router_bias, uint64_t *router_hash, int *router_hash_rows,
+    int *has_bias, int *hash_mode,
+    uint64_t *sink_offset,
+    uint64_t *output_norm_offset, uint64_t *output_weight_offset)
+{
+    if (!e || il < 0 || il >= DS4_N_LAYER) return -1;
+
+    const ds4_layer_weights *l = &e->weights.layer[il];
+
+#define OFF(t) ((t) ? (t)->abs_offset : 0)
+
+    *attn_norm        = OFF(l->attn_norm);
+    *attn_q_a         = OFF(l->attn_q_a);
+    *attn_q_b         = OFF(l->attn_q_b);
+    *attn_kv          = OFF(l->attn_kv);
+    *attn_out_a       = OFF(l->attn_output_a);
+    *attn_out_b       = OFF(l->attn_output_b);
+    *hc_attn_fn       = OFF(l->hc_attn_fn);
+    *hc_attn_scale    = OFF(l->hc_attn_scale);
+    *hc_attn_base     = OFF(l->hc_attn_base);
+    *hc_ffn_fn        = OFF(l->hc_ffn_fn);
+    *hc_ffn_scale     = OFF(l->hc_ffn_scale);
+    *hc_ffn_base      = OFF(l->hc_ffn_base);
+    *ffn_norm         = OFF(l->ffn_norm);
+    *ffn_gate_shexp   = OFF(l->ffn_gate_shexp);
+    *ffn_up_shexp     = OFF(l->ffn_up_shexp);
+    *ffn_down_shexp   = OFF(l->ffn_down_shexp);
+    *ffn_gate_exps    = OFF(l->ffn_gate_exps);
+    *ffn_up_exps      = OFF(l->ffn_up_exps);
+    *ffn_down_exps    = OFF(l->ffn_down_exps);
+
+#undef OFF
+
+    if (l->ffn_gate_exps) {
+        *ffn_gate_type = (int)l->ffn_gate_exps->type;
+        *ffn_expert_in_dim = (int)l->ffn_gate_exps->dim[0];
+        *ffn_expert_mid_dim = (int)l->ffn_gate_exps->dim[1];
+        *ffn_gate_row_bytes = l->ffn_gate_exps->bytes / l->ffn_gate_exps->dim[1];
+        *ffn_gate_expert_bytes = l->ffn_gate_exps->bytes;
+    }
+    if (l->ffn_down_exps) {
+        *ffn_down_type = (int)l->ffn_down_exps->type;
+        *ffn_expert_out_dim = (int)l->ffn_down_exps->dim[1];
+        *ffn_down_row_bytes = l->ffn_down_exps->bytes / l->ffn_down_exps->dim[1];
+        *ffn_down_expert_bytes = l->ffn_down_exps->bytes;
+    }
+
+    *compress_ratio = (int)ds4_layer_compress_ratio((uint32_t)il);
+
+    if (l->attn_compressor_ape) {
+        *compress_ape = l->attn_compressor_ape->abs_offset;
+        *compress_ape_type = (int)l->attn_compressor_ape->type;
+    } else {
+        *compress_ape = 0;
+        *compress_ape_type = 0;
+    }
+
+    if (l->attn_compressor_norm) {
+        *compress_norm = l->attn_compressor_norm->abs_offset;
+        *compress_norm_type = 1;
+    } else {
+        *compress_norm = 0;
+        *compress_norm_type = 0;
+    }
+
+    // RoPE frequencies
+    if (*compress_ratio != 0) {
+        *rope_freq_base = DS4_COMPRESS_ROPE_FREQ_BASE;
+    } else {
+        *rope_freq_base = DS4_ROPE_FREQ_BASE;
+    }
+    *rope_freq_scale = layer_rope_freq_scale((uint32_t)il);
+
+    // Router bias
+    if (l->ffn_gate_inp && l->ffn_gate_inp->bytes > 0) {
+        *router_bias = l->ffn_gate_inp->abs_offset;
+        *has_bias = 1;
+    } else {
+        *router_bias = 0;
+        *has_bias = 0;
+    }
+
+    // Router hash
+    if (l->ffn_gate_tid2eid && l->ffn_gate_tid2eid->bytes > 0) {
+        *router_hash = l->ffn_gate_tid2eid->abs_offset;
+        *router_hash_rows = (int)l->ffn_gate_tid2eid->dim[0];
+        *hash_mode = 1;
+    } else {
+        *router_hash = 0;
+        *router_hash_rows = 0;
+        *hash_mode = 0;
+    }
+
+    // Sink token offset
+    if (l->attn_sinks) {
+        *sink_offset = l->attn_sinks->abs_offset;
+    } else {
+        *sink_offset = 0;
+    }
+
+    // Output weights
+    if (e->weights.output_norm) {
+        *output_norm_offset = e->weights.output_norm->abs_offset;
+    } else {
+        *output_norm_offset = 0;
+    }
+    if (e->weights.output) {
+        *output_weight_offset = e->weights.output->abs_offset;
+    } else {
+        *output_weight_offset = 0;
+    }
+
+    return 0;
+}

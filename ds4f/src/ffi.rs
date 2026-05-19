@@ -168,4 +168,41 @@ extern "C" {
     ) -> c_int;
     pub fn ds4_session_pos(s: *mut ds4_session) -> c_int;
     pub fn ds4_session_ctx(s: *mut ds4_session) -> c_int;
+
+    // ── Bridge: expose model internals for Rust session ─────────────
+    pub fn ds4_bridge_model_map(e: *const ds4_engine) -> *const c_void;
+    pub fn ds4_bridge_model_size(e: *const ds4_engine) -> u64;
+    pub fn ds4_bridge_tensor_data_offset(e: *const ds4_engine) -> u64;
+    pub fn ds4_bridge_tensor_data_size(e: *const ds4_engine) -> u64;
+    pub fn ds4_bridge_n_layer(e: *const ds4_engine) -> c_int;
+    pub fn ds4_bridge_n_embd(e: *const ds4_engine) -> c_int;
+    pub fn ds4_bridge_n_hc(e: *const ds4_engine) -> c_int;
+    pub fn ds4_bridge_n_head(e: *const ds4_engine) -> c_int;
+    pub fn ds4_bridge_head_dim(e: *const ds4_engine) -> c_int;
+    pub fn ds4_bridge_n_rot(e: *const ds4_engine) -> c_int;
+    pub fn ds4_bridge_n_vocab(e: *const ds4_engine) -> c_int;
+    pub fn ds4_bridge_layer_weights(
+        e: *const ds4_engine,
+        il: c_int,
+        attn_norm: *mut u64,
+        attn_q_a: *mut u64, attn_q_b: *mut u64, attn_kv: *mut u64,
+        attn_out_a: *mut u64, attn_out_b: *mut u64,
+        hc_attn_fn: *mut u64, hc_attn_scale: *mut u64, hc_attn_base: *mut u64,
+        hc_ffn_fn: *mut u64, hc_ffn_scale: *mut u64, hc_ffn_base: *mut u64,
+        ffn_norm: *mut u64,
+        ffn_gate_shexp: *mut u64, ffn_up_shexp: *mut u64, ffn_down_shexp: *mut u64,
+        ffn_gate_exps: *mut u64, ffn_up_exps: *mut u64, ffn_down_exps: *mut u64,
+        ffn_gate_type: *mut c_int, ffn_down_type: *mut c_int,
+        ffn_gate_expert_bytes: *mut u64, ffn_gate_row_bytes: *mut u64,
+        ffn_down_expert_bytes: *mut u64, ffn_down_row_bytes: *mut u64,
+        ffn_expert_in_dim: *mut c_int, ffn_expert_mid_dim: *mut c_int, ffn_expert_out_dim: *mut c_int,
+        compress_ratio: *mut c_int,
+        compress_ape: *mut u64, compress_ape_type: *mut c_int,
+        compress_norm: *mut u64, compress_norm_type: *mut c_int,
+        rope_freq_base: *mut f32, rope_freq_scale: *mut f32,
+        router_bias: *mut u64, router_hash: *mut u64, router_hash_rows: *mut c_int,
+        has_bias: *mut c_int, hash_mode: *mut c_int,
+        sink_offset: *mut u64,
+        output_norm_offset: *mut u64, output_weight_offset: *mut u64,
+    ) -> c_int;
 }

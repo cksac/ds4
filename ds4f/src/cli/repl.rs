@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 use crate::ffi;
 use super::args::RunArgs;
 
-pub fn run_repl(engine: *mut ffi::ds4_engine, args: &RunArgs) -> anyhow::Result<()> {
+pub fn run_repl(engine: *mut ffi::ds4_engine, args: &RunArgs, _native: Option<&mut super::native::NativeSession>) -> anyhow::Result<()> {
     let think_mode = match args.think_mode.as_str() {
         "nothink" => ffi::ds4_think_mode::DS4_THINK_NONE,
         "think" => ffi::ds4_think_mode::DS4_THINK_HIGH,

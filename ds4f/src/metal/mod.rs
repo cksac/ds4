@@ -6,4 +6,8 @@ pub mod args;
 pub mod buffers;
 pub mod tensor;
 pub mod commands;
+pub mod graph;
+pub mod session;
+pub mod decode;
+pub mod debug;
 pub mod kernels;

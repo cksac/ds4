@@ -51,7 +51,8 @@ pub unsafe fn device_new_buffer_with_length(device: &AnyObject, length: usize) -
 pub unsafe fn device_new_buffer_with_bytes_no_copy(
     device: &AnyObject, bytes: *mut std::ffi::c_void, length: usize,
 ) -> Option<Retained<AnyObject>> {
-    msg_send![device, newBufferWithBytesNoCopy:bytes, length:length, options:0usize, deallocator:std::ptr::null::<std::ffi::c_void>()]
+    let nil: Option<&objc2::runtime::AnyObject> = None;
+    msg_send![device, newBufferWithBytesNoCopy:bytes, length:length, options:0usize, deallocator:nil]
 }
 
 // ── MTLCommandQueue ────────────────────────────────────────────────────
@@ -120,7 +121,15 @@ pub unsafe fn fn_constants_new() -> Retained<AnyObject> {
     msg_send![objc2::class!(MTLFunctionConstantValues), new]
 }
 pub unsafe fn fn_constants_set_value(constants: &AnyObject, value: *const std::ffi::c_void, ty: usize, index: usize) {
-    let _: () = msg_send![constants, setConstantValue:value, type:ty, atIndex:index];
+    // MTLFunctionConstantValues expects: setConstantValue:(const void *)value type:(MTLDataType)type atIndex:(NSUInteger)index
+    // We need to be very precise about the ObjC types here.
+    use objc2_foundation::NSUInteger;
+    let _: () = msg_send![
+        constants,
+        setConstantValue: value,
+        type: ty as NSUInteger,
+        atIndex: index as NSUInteger
+    ];
 }
 
 // ── MTLCompileOptions ──────────────────────────────────────────────────
