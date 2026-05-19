@@ -9593,18 +9593,17 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
     if (head_dim != 512 || n_head == 0 || n_tokens == 0) {
         return 0;
     }
-    if (n_tokens >= 20) {
-        return ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(cb,
-                                                                         heads,
-                                                                         sinks_buf,
-                                                                         sinks_offset,
-                                                                         q,
-                                                                         raw_kv,
-                                                                         n_tokens,
-                                                                         window,
-                                                                         n_head,
-                                                                         head_dim);
-    }
+    // Always use non-vec path for consistency with Rust
+    return ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(cb,
+                                                                     heads,
+                                                                     sinks_buf,
+                                                                     sinks_offset,
+                                                                     q,
+                                                                     raw_kv,
+                                                                     n_tokens,
+                                                                     window,
+                                                                     n_head,
+                                                                     head_dim);
 
     id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
     id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_kv);

@@ -1057,9 +1057,9 @@ pub fn embed_tokens(
         ne00t: n_embd as i32, ne00: n_embd as i32,
         nb01: n_embd as u64 * 2,
         nb02: 0, nb03: 0,
-        ne10: 1, nb10: 4,
+        ne10: tokens.len() as i32, nb10: 4,
         nb11: 0, nb12: 0,
-        nb1: 0,
+        nb1: n_embd as u64 * 4,
         nb2: 0, nb3: 0,
     };
     let n = tokens.len() * n_embd as usize;
@@ -1375,6 +1375,62 @@ pub fn matmul_id_q4_K_sum6(
         (32, nsg as usize, 1), smem)
 }
 
+// ─── Expert matmul: Q4_K non-pair (gate+up, two separate passes) ────────
+// Matches C's non-pair dispatch path used when n_tokens > 4
+// (C: use_tiny_pair_mv = false → kernel_mul_mv_id_q4_K_f32 twice).
+
+#[allow(non_snake_case)]
+pub fn matmul_id_q4_K_nonpair_sum6(
+    dst_gate: &GpuTensor, dst_up: &GpuTensor,
+    views: &ModelViews, gate_offset: u64, up_offset: u64,
+    in_dim: u32, out_dim: u32, n_expert: u32,
+    x: &GpuTensor, selected: &[i32],
+) -> Result<(), &'static str> {
+    let nr0: u32 = 2;
+    let nb01 = in_dim as u64 / 256 * 144;
+    let step = nb01 * out_dim as u64;
+    let total_bytes = step * n_expert as u64;
+    let (wbuf_g, woff_g) = views.find_view(gate_offset, total_bytes)
+        .ok_or("q4_K nonpair gate view not found")?;
+    let (wbuf_u, woff_u) = views.find_view(up_offset, total_bytes)
+        .ok_or("q4_K nonpair up view not found")?;
+    let n_sel = selected.len();
+    let args = MulMvIdArgs {
+        nei0: n_sel as i32, nei1: 1, nbi1: (n_sel * 4) as u64,
+        ne00: in_dim as i32, ne01: out_dim as i32,
+        ne02: (n_expert * in_dim / 256 * 144) as i32,
+        nb00: 144, nb01, nb02: step,
+        ne10: in_dim as i32, ne11: 1, ne12: 1, ne13: 1,
+        nb10: 4, nb11: in_dim as u64 * 4, nb12: 0,
+        ne0: out_dim as i32, ne1: 1, nb1: out_dim as u64 * 4,
+        nr0: nr0 as i32,
+    };
+    let device = bridge::device().ok_or("no device")?;
+    let sel_buf = unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::new(selected.as_ptr() as *mut c_void).unwrap(),
+            n_sel * 4,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }.ok_or("sel buffer")?;
+    let nsg: i16 = 4;
+    let p = make_matmul_pipeline("kernel_mul_mv_id_q4_K_f32", nsg, 1)
+        .ok_or("q4_K nonpair pipeline")?;
+    let smem = (32 * nr0 * 4) as u64;
+    // Gate pass
+    dispatch_with_args_tg(&*p, &args,
+        &[(Some(wbuf_g), woff_g), (x.buf_ref(), x.offset_raw()),
+          (dst_gate.buf_ref(), dst_gate.offset_raw()), (Some(&*sel_buf), 0)],
+        ((out_dim / nr0 + 1) as usize, 1, n_sel),
+        (32, nsg as usize, 1), smem)?;
+    // Up pass
+    dispatch_with_args_tg(&*p, &args,
+        &[(Some(wbuf_u), woff_u), (x.buf_ref(), x.offset_raw()),
+          (dst_up.buf_ref(), dst_up.offset_raw()), (Some(&*sel_buf), 0)],
+        ((out_dim / nr0 + 1) as usize, 1, n_sel),
+        (32, nsg as usize, 1), smem)
+}
+
 // ─── Expert matmul: Q8_0 id (single output) ────────────────────────────
 
 pub fn matmul_id_q8_0_f32(
@@ -1619,6 +1675,571 @@ pub fn softplus_sqrt(
         (1, 1, 1), (256, 1, 1))
 }
 
+// ─── Flash attention (batch prefill, non-vec) ──────────────────────────
+
+#[repr(C)]
+struct CpyArgs {
+    nk0: i64, ne00: i64, ne01: i64, ne02: i64, ne03: i64,
+    nb00: u64, nb01: u64, nb02: u64, nb03: u64,
+    ne0: i64, ne1: i64, ne2: i64, ne3: i64,
+    nb0: u64, nb1: u64, nb2: u64, nb3: u64,
+}
+
+#[repr(C)]
+struct FlashAttnPadArgs {
+    ne11: i32, ne_12_2: i32, ne_12_3: i32,
+    nb11: u64, nb12: u64, nb13: u64,
+    nb21: u64, nb22: u64, nb23: u64,
+    ne31: i32, ne32: i32, ne33: i32,
+    nb31: u64, nb32: u64, nb33: u64,
+}
+
+#[repr(C)]
+struct FlashAttnBlkArgs {
+    ne01: i32, ne30: i32, ne31: i32, ne32: i32, ne33: i32,
+    nb31: u64, nb32: u64, nb33: u64,
+}
+
+fn make_attn_prefill_pad_pipeline(has_mask: bool, ncpsg: i32)
+    -> Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>
+{
+    let key = format!("kernel_flash_attn_ext_pad_mask={}_ncpsg={}", has_mask, ncpsg);
+    if let Some(p) = pipeline::get_pipeline(&key) { return Some(p); }
+    let lib = bridge::library()?;
+    let fcv = MTLFunctionConstantValues::new();
+    unsafe {
+        let mut v = has_mask as u8;
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut v as *mut u8 as *mut c_void).unwrap(),
+            MTLDataType::Bool, 100);
+        let mut nc = ncpsg;
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut nc as *mut i32 as *mut c_void).unwrap(),
+            MTLDataType::Int, 125);
+    }
+    let ns_name = NSString::from_str("kernel_flash_attn_ext_pad");
+    let fn_ = lib.newFunctionWithName_constantValues_error(&*ns_name, &*fcv).ok()?;
+    let device = bridge::device()?;
+    let p = device.newComputePipelineStateWithFunction_error(&*fn_).ok()?;
+    pipeline::cache_pipeline(&key, p.clone());
+    Some(p)
+}
+
+fn make_attn_prefill_blk_pipeline(nqptg: i32, ncpsg: i32)
+    -> Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>
+{
+    let key = format!("kernel_flash_attn_ext_blk_nqptg={}_ncpsg={}", nqptg, ncpsg);
+    if let Some(p) = pipeline::get_pipeline(&key) { return Some(p); }
+    let lib = bridge::library()?;
+    let fcv = MTLFunctionConstantValues::new();
+    unsafe {
+        let mut nq = nqptg;
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut nq as *mut i32 as *mut c_void).unwrap(),
+            MTLDataType::Int, 224);
+        let mut nc = ncpsg;
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut nc as *mut i32 as *mut c_void).unwrap(),
+            MTLDataType::Int, 225);
+    }
+    let ns_name = NSString::from_str("kernel_flash_attn_ext_blk");
+    let fn_ = lib.newFunctionWithName_constantValues_error(&*ns_name, &*fcv).ok()?;
+    let device = bridge::device()?;
+    let p = device.newComputePipelineStateWithFunction_error(&*fn_).ok()?;
+    pipeline::cache_pipeline(&key, p.clone());
+    Some(p)
+}
+
+fn make_attn_prefill_pipeline_full(
+    name: &str,
+    has_mask: bool, has_sinks: bool, has_bias: bool, has_scap: bool, has_kvpad: bool,
+    bc_mask: bool,
+    ns10: i32, ns20: i32, nsg: i32,
+) -> Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>
+{
+    let key = format!("{}_{}_{}_{}_{}_{}_{}_{}_{}_{}", name,
+        has_mask, has_sinks, has_bias, has_scap, has_kvpad, bc_mask,
+        ns10, ns20, nsg);
+    if let Some(p) = pipeline::get_pipeline(&key) { return Some(p); }
+    let lib = bridge::library()?;
+    let fcv = MTLFunctionConstantValues::new();
+    unsafe {
+        let mut v: u8;
+        let mut vi: i32;
+        v = has_mask as u8;
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut v as *mut u8 as *mut c_void).unwrap(),
+            MTLDataType::Bool, 300);
+        v = has_sinks as u8;
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut v as *mut u8 as *mut c_void).unwrap(),
+            MTLDataType::Bool, 301);
+        v = has_bias as u8;
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut v as *mut u8 as *mut c_void).unwrap(),
+            MTLDataType::Bool, 302);
+        v = has_scap as u8;
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut v as *mut u8 as *mut c_void).unwrap(),
+            MTLDataType::Bool, 303);
+        v = has_kvpad as u8;
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut v as *mut u8 as *mut c_void).unwrap(),
+            MTLDataType::Bool, 304);
+        v = bc_mask as u8;
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut v as *mut u8 as *mut c_void).unwrap(),
+            MTLDataType::Bool, 310);
+        vi = ns10;
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut vi as *mut i32 as *mut c_void).unwrap(),
+            MTLDataType::Int, 320);
+        vi = ns20;
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut vi as *mut i32 as *mut c_void).unwrap(),
+            MTLDataType::Int, 321);
+        vi = nsg;
+        fcv.setConstantValue_type_atIndex(
+            NonNull::new(&mut vi as *mut i32 as *mut c_void).unwrap(),
+            MTLDataType::Int, 322);
+    }
+    let ns_name = NSString::from_str(name);
+    let fn_ = lib.newFunctionWithName_constantValues_error(&*ns_name, &*fcv).ok()?;
+    let device = bridge::device()?;
+    let p = device.newComputePipelineStateWithFunction_error(&*fn_).ok()?;
+    pipeline::cache_pipeline(&key, p.clone());
+    Some(p)
+}
+
+fn fill_raw_prefill_mask(mask: &mut [u16], n_tokens: u32, window: u32) {
+    let neg_inf_half: u16 = 0xfc00u16;
+    let nt = n_tokens as usize;
+    for q in 0..nt {
+        for k in 0..nt {
+            let causal = k <= q;
+            let in_window = window == 0 || (q as u32).wrapping_sub(k as u32) < window;
+            mask[q * nt + k] = if causal && in_window { 0u16 } else { neg_inf_half };
+        }
+    }
+}
+
+fn fill_static_mixed_prefill_mask(
+    mask: &mut [u16],
+    n_tokens: u32,
+    n_comp: u32,
+    window: u32,
+    ratio: u32,
+) {
+    let neg_inf_half: u16 = 0xfc00u16;
+    let n_keys = (n_tokens + n_comp) as usize;
+    let nt = n_tokens as usize;
+    let nc = n_comp as usize;
+    for q in 0..nt {
+        let row = &mut mask[q * n_keys..(q + 1) * n_keys];
+        // Raw KV: causal + sliding-window
+        for k in 0..nt {
+            let causal = k <= q;
+            let in_window = window == 0 || (q as u32).wrapping_sub(k as u32) < window;
+            row[k] = if causal && in_window { 0u16 } else { neg_inf_half };
+        }
+        // Comp KV: comp[c] is visible to q only if it was emitted before q,
+        // matching C's rule: comp[c] visible iff (q+1)/ratio > c
+        // i.e. floor((q+1)/ratio) > c, first true when q == ratio-1 (q=3 for ratio=4).
+        let n_visible = ((q as u32 + 1) / ratio) as usize;
+        for c in 0..nc {
+            row[nt + c] = if c < n_visible { 0u16 } else { neg_inf_half };
+        }
+    }
+}
+
+fn align_up(x: usize, n: usize) -> usize {
+    (x + n - 1) & !(n - 1)
+}
+
+/// Batch FlashAttention for prefill, matching C's non-vec path.
+pub fn flash_attn_prefill_batch_raw(
+    dst: &GpuTensor,
+    q: &GpuTensor,
+    raw_kv: &GpuTensor,
+    sinks_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
+    sinks_offset: u64,
+    n_tokens: u32,
+    window: u32,
+    n_head: u32,
+    head_dim: u32,
+) -> Result<(), &'static str> {
+    if head_dim != 512 { return Err("flash_attn_prefill_batch_raw: head_dim must be 512"); }
+    if n_tokens == 0 || n_head == 0 { return Ok(()); }
+
+    let nqptg: u32 = 8;
+    let ncpsg: u32 = 64;
+    let nsg: i32 = 8;
+    let has_kvpad = (n_tokens % ncpsg) != 0;
+    let bc_mask = (n_tokens % nqptg) != 0;
+
+    let row_bytes = head_dim as usize * 4;
+    let row_bytes_f16 = head_dim as usize * 2;
+    let mask_bytes = n_tokens as usize * n_tokens as usize * 2;
+    let kv_bytes = n_tokens as usize * row_bytes_f16;
+    let pad_bytes = if has_kvpad {
+        ncpsg as usize * (2 * row_bytes_f16 + n_tokens as usize * 2)
+    } else {
+        1usize
+    };
+    let nblk0 = ((n_tokens as usize) + ncpsg as usize - 1) / ncpsg as usize;
+    let nblk1 = ((n_tokens as usize) + nqptg as usize - 1) / nqptg as usize;
+    let blk_bytes = align_up(nblk0 * nblk1, 32);
+
+    let device = bridge::device().ok_or("no device")?;
+
+    let mask_buf = unsafe {
+        device.newBufferWithLength_options(mask_bytes, MTLResourceOptions::StorageModeShared)
+    }.ok_or("mask buf alloc")?;
+    unsafe {
+        let ptr = mask_buf.contents().as_ptr() as *mut u16;
+        let slice = std::slice::from_raw_parts_mut(ptr, n_tokens as usize * n_tokens as usize);
+        fill_raw_prefill_mask(slice, n_tokens, window);
+    }
+
+    let kv_f16_buf = unsafe {
+        device.newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModePrivate)
+    }.ok_or("kv_f16 buf alloc")?;
+
+    let pad_buf = unsafe {
+        device.newBufferWithLength_options(pad_bytes, MTLResourceOptions::StorageModePrivate)
+    }.ok_or("pad buf alloc")?;
+
+    let blk_buf = unsafe {
+        device.newBufferWithLength_options(blk_bytes, MTLResourceOptions::StorageModePrivate)
+    }.ok_or("blk buf alloc")?;
+
+    let cpy_pipeline = get_or_create_pipeline("kernel_cpy_f32_f16").ok_or("cpy pipeline")?;
+
+    let pad_pipeline = if has_kvpad {
+        Some(make_attn_prefill_pad_pipeline(true, ncpsg as i32).ok_or("pad pipeline")?)
+    } else {
+        None
+    };
+
+    let blk_pipeline = make_attn_prefill_blk_pipeline(nqptg as i32, ncpsg as i32)
+        .ok_or("blk pipeline")?;
+
+    let attn_pipeline = make_attn_prefill_pipeline_full(
+        "kernel_flash_attn_ext_f16_dk512_dv512",
+        true, true, false, false, has_kvpad, bc_mask,
+        head_dim as i32, head_dim as i32, nsg,
+    ).ok_or("attn pipeline")?;
+
+    // Step 1: f32 -> f16 copy of raw KV
+    {
+        let n_elems = n_tokens as u64 * head_dim as u64;
+        let cpy_args = CpyArgs {
+            nk0: n_elems as i64,
+            ne00: n_elems as i64, ne01: 1, ne02: 1, ne03: 1,
+            nb00: 4, nb01: n_elems * 4, nb02: n_elems * 4, nb03: n_elems * 4,
+            ne0: n_elems as i64, ne1: 1, ne2: 1, ne3: 1,
+            nb0: 2, nb1: n_elems * 2, nb2: n_elems * 2, nb3: n_elems * 2,
+        };
+        let nth = 32usize;
+        let groups = ((n_elems as usize) + nth - 1) / nth;
+        dispatch_with_args(&*cpy_pipeline, &cpy_args,
+            &[(raw_kv.buf_ref(), raw_kv.offset_raw()),
+              (Some(&*kv_f16_buf), 0)],
+            (groups, 1, 1), (nth, 1, 1))?;
+    }
+
+    // Step 2: Pad kernel
+    if let Some(ref pp) = pad_pipeline {
+        let pad_args = FlashAttnPadArgs {
+            ne11: n_tokens as i32, ne_12_2: 1, ne_12_3: 1,
+            nb11: row_bytes_f16 as u64,
+            nb12: n_tokens as u64 * row_bytes_f16 as u64,
+            nb13: n_tokens as u64 * row_bytes_f16 as u64,
+            nb21: row_bytes_f16 as u64,
+            nb22: n_tokens as u64 * row_bytes_f16 as u64,
+            nb23: n_tokens as u64 * row_bytes_f16 as u64,
+            ne31: n_tokens as i32, ne32: 1, ne33: 1,
+            nb31: n_tokens as u64 * 2,
+            nb32: mask_bytes as u64,
+            nb33: mask_bytes as u64,
+        };
+        dispatch_with_args(&**pp, &pad_args,
+            &[(Some(&*kv_f16_buf), 0),
+              (Some(&*kv_f16_buf), 0),
+              (Some(&*mask_buf), 0),
+              (Some(&*pad_buf), 0)],
+            (ncpsg as usize, 1, 1), (32, 1, 1))?;
+    }
+
+    // Step 3: Blk kernel
+    {
+        let blk_args = FlashAttnBlkArgs {
+            ne01: n_tokens as i32, ne30: n_tokens as i32,
+            ne31: n_tokens as i32, ne32: 1, ne33: 1,
+            nb31: n_tokens as u64 * 2,
+            nb32: mask_bytes as u64,
+            nb33: mask_bytes as u64,
+        };
+        dispatch_with_args(&*blk_pipeline, &blk_args,
+            &[(Some(&*mask_buf), 0),
+              (Some(&*blk_buf), 0)],
+            (nblk0, nblk1, 1), (32, 1, 1))?;
+    }
+
+    // Step 4: Attention kernel
+    {
+        let attn_args = FlashAttnExtArgs {
+            ne01: n_tokens as i32, ne02: n_head as i32, ne03: 1,
+            nb01: n_head as u64 * row_bytes as u64,
+            nb02: row_bytes as u64,
+            nb03: n_tokens as u64 * n_head as u64 * row_bytes as u64,
+            ne11: n_tokens as i32, ne_12_2: 1, ne_12_3: 1,
+            ns10: head_dim as i32,
+            nb11: row_bytes_f16 as u64,
+            nb12: n_tokens as u64 * row_bytes_f16 as u64,
+            nb13: n_tokens as u64 * row_bytes_f16 as u64,
+            ns20: head_dim as i32,
+            nb21: row_bytes_f16 as u64,
+            nb22: n_tokens as u64 * row_bytes_f16 as u64,
+            nb23: n_tokens as u64 * row_bytes_f16 as u64,
+            ne31: n_tokens as i32, ne32: 1, ne33: 1,
+            nb31: n_tokens as u64 * 2,
+            nb32: mask_bytes as u64,
+            nb33: mask_bytes as u64,
+            ne1: n_head as i32, ne2: n_tokens as i32, ne3: 1,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            max_bias: 0.0, m0: 0.0, m1: 0.0,
+            n_head_log2: 0, logit_softcap: 0.0,
+        };
+        let padded_v = align_up(head_dim as usize, 64);
+        let shared_elems = nqptg as usize * (head_dim as usize + 2 * padded_v + 2 * (2 * ncpsg as usize));
+        let shared_bytes = align_up(shared_elems * 2, 16) as u64;
+
+        dispatch_with_args_tg(&*attn_pipeline, &attn_args,
+            &[(q.buf_ref(), q.offset_raw()),
+              (Some(&*kv_f16_buf), 0),
+              (Some(&*kv_f16_buf), 0),
+              (Some(&*mask_buf), 0),
+              (sinks_buf, sinks_offset),
+              (Some(&*pad_buf), 0),
+              (Some(&*blk_buf), 0),
+              (dst.buf_ref(), dst.offset_raw())],
+            (nblk1, n_head as usize, 1), (32, nsg as usize, 1),
+            shared_bytes)?;
+    }
+
+    Ok(())
+}
+
+/// Batch FlashAttention for prefill with static mixed (raw + compressed) KV.
+/// Matches C's `ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long`.
+/// - `raw_kv`: [n_tokens × head_dim] f32 (post-RoPE raw KV for this batch)
+/// - `comp_kv`: [n_comp × head_dim] f32 (FP8-rounded values, stored as f32)
+/// - `n_tokens`: number of query/raw-KV tokens
+/// - `n_comp`: number of compressed KV rows already in comp_kv
+/// - `ratio`: compression ratio (needed for mask generation)
+pub fn flash_attn_prefill_batch_static_mixed(
+    dst: &GpuTensor,
+    q: &GpuTensor,
+    raw_kv: &GpuTensor,
+    comp_kv: &GpuTensor,
+    sinks_buf: Option<&ProtocolObject<dyn MTLBuffer>>,
+    sinks_offset: u64,
+    n_tokens: u32,
+    n_comp: u32,
+    window: u32,
+    ratio: u32,
+    n_head: u32,
+    head_dim: u32,
+) -> Result<(), &'static str> {
+    if head_dim != 512 { return Err("flash_attn_prefill_batch_static_mixed: head_dim must be 512"); }
+    if n_tokens == 0 || n_head == 0 { return Ok(()); }
+    if n_comp == 0 {
+        return flash_attn_prefill_batch_raw(dst, q, raw_kv, sinks_buf, sinks_offset, n_tokens, window, n_head, head_dim);
+    }
+
+    let n_keys = n_tokens + n_comp;
+    let nqptg: u32 = 8;
+    let ncpsg: u32 = 64;
+    let nsg: i32 = 8;
+    let has_kvpad = (n_keys % ncpsg) != 0;
+    let bc_mask = (n_tokens % nqptg) != 0;
+
+    let row_bytes     = head_dim as usize * 4;
+    let row_bytes_f16 = head_dim as usize * 2;
+    // mask: n_tokens rows × n_keys cols
+    let mask_bytes = n_tokens as usize * n_keys as usize * 2;
+    // KV f16 buf: n_keys rows (raw + comp interleaved sequentially)
+    let kv_bytes = n_keys as usize * row_bytes_f16;
+    let pad_bytes = if has_kvpad {
+        ncpsg as usize * (2 * row_bytes_f16 + n_tokens as usize * 2)
+    } else {
+        1usize
+    };
+    let nblk0 = ((n_keys as usize) + ncpsg as usize - 1) / ncpsg as usize;
+    let nblk1 = ((n_tokens as usize) + nqptg as usize - 1) / nqptg as usize;
+    let blk_bytes = align_up(nblk0 * nblk1, 32);
+
+    let device = bridge::device().ok_or("no device")?;
+
+    let mask_buf = unsafe {
+        device.newBufferWithLength_options(mask_bytes, MTLResourceOptions::StorageModeShared)
+    }.ok_or("static-mixed mask buf alloc")?;
+    unsafe {
+        let ptr = mask_buf.contents().as_ptr() as *mut u16;
+        let slice = std::slice::from_raw_parts_mut(ptr, n_tokens as usize * n_keys as usize);
+        fill_static_mixed_prefill_mask(slice, n_tokens, n_comp, window, ratio);
+    }
+
+    let kv_f16_buf = unsafe {
+        device.newBufferWithLength_options(kv_bytes, MTLResourceOptions::StorageModePrivate)
+    }.ok_or("static-mixed kv_f16 buf alloc")?;
+
+    let pad_buf = unsafe {
+        device.newBufferWithLength_options(pad_bytes, MTLResourceOptions::StorageModePrivate)
+    }.ok_or("static-mixed pad buf alloc")?;
+
+    let blk_buf = unsafe {
+        device.newBufferWithLength_options(blk_bytes, MTLResourceOptions::StorageModePrivate)
+    }.ok_or("static-mixed blk buf alloc")?;
+
+    let cpy_pipeline = get_or_create_pipeline("kernel_cpy_f32_f16").ok_or("cpy pipeline")?;
+
+    let pad_pipeline = if has_kvpad {
+        Some(make_attn_prefill_pad_pipeline(true, ncpsg as i32).ok_or("pad pipeline")?)
+    } else {
+        None
+    };
+
+    let blk_pipeline = make_attn_prefill_blk_pipeline(nqptg as i32, ncpsg as i32)
+        .ok_or("blk pipeline")?;
+
+    let attn_pipeline = make_attn_prefill_pipeline_full(
+        "kernel_flash_attn_ext_f16_dk512_dv512",
+        true, true, false, false, has_kvpad, bc_mask,
+        head_dim as i32, head_dim as i32, nsg,
+    ).ok_or("attn pipeline")?;
+
+    // Step 1a: f32 → f16 copy of raw KV into kv_f16_buf[0..n_tokens*row_bytes_f16]
+    {
+        let n_elems = n_tokens as u64 * head_dim as u64;
+        let cpy_args = CpyArgs {
+            nk0: n_elems as i64,
+            ne00: n_elems as i64, ne01: 1, ne02: 1, ne03: 1,
+            nb00: 4, nb01: n_elems * 4, nb02: n_elems * 4, nb03: n_elems * 4,
+            ne0:  n_elems as i64, ne1: 1, ne2: 1, ne3: 1,
+            nb0: 2, nb1: n_elems * 2, nb2: n_elems * 2, nb3: n_elems * 2,
+        };
+        let nth = 32usize;
+        let groups = ((n_elems as usize) + nth - 1) / nth;
+        dispatch_with_args(&*cpy_pipeline, &cpy_args,
+            &[(raw_kv.buf_ref(), raw_kv.offset_raw()),
+              (Some(&*kv_f16_buf), 0)],
+            (groups, 1, 1), (nth, 1, 1))?;
+    }
+
+    // Step 1b: f32 → f16 copy of comp KV into kv_f16_buf[n_tokens*row_bytes_f16..]
+    {
+        let comp_dest_offset = n_tokens as u64 * head_dim as u64 * 2; // bytes
+        let n_elems = n_comp as u64 * head_dim as u64;
+        let cpy_args = CpyArgs {
+            nk0: n_elems as i64,
+            ne00: n_elems as i64, ne01: 1, ne02: 1, ne03: 1,
+            nb00: 4, nb01: n_elems * 4, nb02: n_elems * 4, nb03: n_elems * 4,
+            ne0:  n_elems as i64, ne1: 1, ne2: 1, ne3: 1,
+            nb0: 2, nb1: n_elems * 2, nb2: n_elems * 2, nb3: n_elems * 2,
+        };
+        let nth = 32usize;
+        let groups = ((n_elems as usize) + nth - 1) / nth;
+        dispatch_with_args(&*cpy_pipeline, &cpy_args,
+            &[(comp_kv.buf_ref(), comp_kv.offset_raw()),
+              (Some(&*kv_f16_buf), comp_dest_offset)],
+            (groups, 1, 1), (nth, 1, 1))?;
+    }
+
+    // Step 2: Pad kernel (uses n_keys for all KV stride args)
+    if let Some(ref pp) = pad_pipeline {
+        let pad_args = FlashAttnPadArgs {
+            ne11: n_keys as i32, ne_12_2: 1, ne_12_3: 1,
+            nb11: row_bytes_f16 as u64,
+            nb12: n_keys as u64 * row_bytes_f16 as u64,
+            nb13: n_keys as u64 * row_bytes_f16 as u64,
+            nb21: row_bytes_f16 as u64,
+            nb22: n_keys as u64 * row_bytes_f16 as u64,
+            nb23: n_keys as u64 * row_bytes_f16 as u64,
+            ne31: n_tokens as i32, ne32: 1, ne33: 1,
+            nb31: n_keys as u64 * 2,
+            nb32: mask_bytes as u64,
+            nb33: mask_bytes as u64,
+        };
+        dispatch_with_args(&**pp, &pad_args,
+            &[(Some(&*kv_f16_buf), 0),
+              (Some(&*kv_f16_buf), 0),
+              (Some(&*mask_buf), 0),
+              (Some(&*pad_buf), 0)],
+            (ncpsg as usize, 1, 1), (32, 1, 1))?;
+    }
+
+    // Step 3: Blk kernel (ne30 = n_keys, nb31 = n_keys*2)
+    {
+        let blk_args = FlashAttnBlkArgs {
+            ne01: n_tokens as i32, ne30: n_keys as i32,
+            ne31: n_tokens as i32, ne32: 1, ne33: 1,
+            nb31: n_keys as u64 * 2,
+            nb32: mask_bytes as u64,
+            nb33: mask_bytes as u64,
+        };
+        dispatch_with_args(&*blk_pipeline, &blk_args,
+            &[(Some(&*mask_buf), 0),
+              (Some(&*blk_buf), 0)],
+            (nblk0, nblk1, 1), (32, 1, 1))?;
+    }
+
+    // Step 4: Attention kernel (ne11 = n_keys, all KV strides use n_keys)
+    {
+        let attn_args = FlashAttnExtArgs {
+            ne01: n_tokens as i32, ne02: n_head as i32, ne03: 1,
+            nb01: n_head as u64 * row_bytes as u64,
+            nb02: row_bytes as u64,
+            nb03: n_tokens as u64 * n_head as u64 * row_bytes as u64,
+            ne11: n_keys as i32, ne_12_2: 1, ne_12_3: 1,
+            ns10: head_dim as i32,
+            nb11: row_bytes_f16 as u64,
+            nb12: n_keys as u64 * row_bytes_f16 as u64,
+            nb13: n_keys as u64 * row_bytes_f16 as u64,
+            ns20: head_dim as i32,
+            nb21: row_bytes_f16 as u64,
+            nb22: n_keys as u64 * row_bytes_f16 as u64,
+            nb23: n_keys as u64 * row_bytes_f16 as u64,
+            ne31: n_tokens as i32, ne32: 1, ne33: 1,
+            nb31: n_keys as u64 * 2,
+            nb32: mask_bytes as u64,
+            nb33: mask_bytes as u64,
+            ne1: n_head as i32, ne2: n_tokens as i32, ne3: 1,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            max_bias: 0.0, m0: 0.0, m1: 0.0,
+            n_head_log2: 0, logit_softcap: 0.0,
+        };
+        let padded_v = align_up(head_dim as usize, 64);
+        let shared_elems = nqptg as usize * (head_dim as usize + 2 * padded_v + 2 * (2 * ncpsg as usize));
+        let shared_bytes = align_up(shared_elems * 2, 16) as u64;
+
+        dispatch_with_args_tg(&*attn_pipeline, &attn_args,
+            &[(q.buf_ref(), q.offset_raw()),
+              (Some(&*kv_f16_buf), 0),
+              (Some(&*kv_f16_buf), 0),
+              (Some(&*mask_buf), 0),
+              (sinks_buf, sinks_offset),
+              (Some(&*pad_buf), 0),
+              (Some(&*blk_buf), 0),
+              (dst.buf_ref(), dst.offset_raw())],
+            (nblk1, n_head as usize, 1), (32, nsg as usize, 1),
+            shared_bytes)?;
+    }
+
+    Ok(())
+}
+
 // ─── Flash attention (prefill) ──────────────────────────────────────────
 
 pub fn flash_attn_prefill(
@@ -1676,6 +2297,26 @@ pub fn repeat_f32(
         &[(src.buf_ref(), src.offset_raw()),
           (dst.buf_ref(), dst.offset_raw())],
         (ne1 as usize, 1, 1), (256, 1, 1))
+}
+
+// ─── GPU f32 copy ───────────────────────────────────────────────────────
+
+pub fn copy_f32(dst: &GpuTensor, src: &GpuTensor, n: usize) -> Result<(), &'static str> {
+    let n64 = n as i64;
+    let nb  = n as u64 * 4;
+    let args = CpyArgs {
+        nk0: n64,
+        ne00: n64, ne01: 1, ne02: 1, ne03: 1,
+        nb00: 4,   nb01: nb, nb02: nb, nb03: nb,
+        ne0:  n64, ne1:  1,  ne2:  1,  ne3:  1,
+        nb0:  4,   nb1:  nb, nb2:  nb, nb3:  nb,
+    };
+    let nth    = 32usize;
+    let groups = (n + nth - 1) / nth;
+    dispatch_pipeline("kernel_cpy_f32_f32", &args,
+        &[(src.buf_ref(), src.offset_raw()),
+          (dst.buf_ref(), dst.offset_raw())],
+        (groups, 1, 1), (nth, 1, 1))
 }
 
 // ─── Compressor ratio4 shift ────────────────────────────────────────────

@@ -9404,7 +9404,9 @@ static bool metal_graph_encode_output_head(
         const ds4_weights     *weights,
         uint64_t               vocab_dim) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    metal_graph_debug_dump_tensor("cur_hc_head", g->cur_hc, hc_dim, DS4_N_LAYER, 0);
     bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+    if (ok) metal_graph_debug_dump_tensor("flat_hc", g->flat_hc, hc_dim, DS4_N_LAYER, 0);
     if (ok) ok = ds4_gpu_matmul_f16_tensor(g->output_pre,
                                              model->map,
                                              model->size,

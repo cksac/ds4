@@ -25,6 +25,8 @@ TENSOR NAME ALIASES
 C and Rust use slightly different names for a few tensors:
   C name                       Rust name
   ─────────────────────────── ─────────────────────────────
+  hc_attn_pre_mixes           hc_mix_before_sinkhorn
+  hc_attn_pre_weights         hc_split_after_sinkhorn  (C=4 floats, Rust=24)
   ffn_moe_gate_clamped        ffn_moe_gate
   ffn_moe_up_clamped          ffn_moe_up
   ffn_moe_weighted_swiglu     ffn_moe_swiglu
@@ -59,6 +61,8 @@ N_LAYER = 43
 #   ("c_name", "rs_name")     - different names but same semantic content
 #   ("c_name", "rs_name", "i32")  - integer tensor (raw i32 file)
 LAYER_TENSORS_ORDERED = [
+    ("hc_attn_pre_mixes",    "hc_mix_before_sinkhorn"),   # hc_mix after matmul, before sinkhorn (24 floats)
+    ("hc_attn_pre_weights",  "hc_split_after_sinkhorn"),  # sinkhorn output pre-weights (C=4, Rust=24 - compare first 4)
     "hc_attn_pre",           # attn_cur after HC weighted sum  (N_EMBD)
     "attn_norm",             # after attention RMSNorm         (N_EMBD)
     "q_lora",                # Q LoRA compression              (N_LORA_Q)
@@ -356,7 +360,7 @@ def run_dumps(prompt: str, n_generate: int, sys_prompt: str,
     if pos_filter:
         rs_env["DS4_DUMP_POS"] = pos_filter
 
-    c_cmd = [c_bin, "--metal", f"--ctx=16384", "-sys", sys_prompt,
+    c_cmd = [c_bin, "--metal", "--ctx", "16384", "-sys", sys_prompt,
              "-n", str(n_generate), "-p", prompt] + nothink_c
     rs_cmd = [rs_bin, "run", f"--ctx-size=16384", "--system", sys_prompt,
               "-n", str(n_generate), "-p", prompt] + nothink_rs
