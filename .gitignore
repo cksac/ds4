@@ -14,3 +14,4 @@
 /misc/
 .*.swp
 .DS_Store
+/kv_cache
